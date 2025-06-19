@@ -504,7 +504,7 @@ class Graph4Exporter (Gimp.PlugIn):
                 return procedure.new_return_values(*result)
             else:
                 dialog.destroy()
-                return procedure.new_return_values(*result)
+                return procedure.new_return_values(Gimp.PDBStatusType.CANCEL, None)
 
     def convert(self, *args):
         # Run code in a different thread
