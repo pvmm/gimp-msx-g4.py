@@ -15,6 +15,7 @@ from __future__ import print_function
 import gimpfu
 import gimp
 import os
+import json
 import struct
 import traceback
 import sys
@@ -41,6 +42,67 @@ SCREEN_MODES = {
     SCREEN5: {"width": 256, "line_size": 128, "page_size": 0x8000, "palette_offset": 0x7680, "suffix": "5"},
     SCREEN7: {"width": 512, "line_size": 256, "page_size": 0x10000, "palette_offset": 0xFA80, "suffix": "7"},
 }
+
+SETTINGS_FILE = "msx-g4-settings.json"
+
+
+def _settings_path():
+    return os.path.join(gimp.directory, SETTINGS_FILE)
+
+
+def load_settings():
+    defaults = {
+        "filename": DEFAULT_FILENAME,
+        "folder": DEFAULT_OUTPUT_DIR,
+        "screen_mode": SCREEN5,
+        "interlaced": 0,
+        "dithering": 1,
+        "export_pal": 0,
+        "skip_index0": 1,
+        "trans_color": [255, 0, 255],
+        "encoding": DEFAULT_OUTPUT_FMT,
+        "pal_file": 0,
+    }
+    try:
+        with open(_settings_path(), "r") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            defaults.update({k: data[k] for k in defaults if k in data})
+    except Exception:
+        pass
+    if defaults.get("screen_mode") not in (SCREEN5, SCREEN7):
+        defaults["screen_mode"] = SCREEN5
+    if defaults.get("encoding") not in ("SC", "SR", "DAT", "RAW", "no-output"):
+        defaults["encoding"] = DEFAULT_OUTPUT_FMT
+    tc = defaults.get("trans_color")
+    if not (isinstance(tc, (list, tuple)) and len(tc) >= 3):
+        defaults["trans_color"] = [255, 0, 255]
+    else:
+        defaults["trans_color"] = [int(tc[0]), int(tc[1]), int(tc[2])]
+    for key in ("interlaced", "dithering", "export_pal", "skip_index0", "pal_file"):
+        defaults[key] = int(bool(defaults.get(key, 0)))
+    folder = defaults.get("folder")
+    if not isinstance(folder, str) or not os.path.isdir(folder):
+        defaults["folder"] = DEFAULT_OUTPUT_DIR
+    name = defaults.get("filename")
+    if not isinstance(name, str) or not name:
+        defaults["filename"] = DEFAULT_FILENAME
+    return defaults
+
+
+def save_settings(settings):
+    try:
+        path = _settings_path()
+        d = os.path.dirname(path)
+        if d and not os.path.isdir(d):
+            os.makedirs(d)
+        with open(path, "w") as f:
+            json.dump(settings, f, indent=2, sort_keys=True)
+    except Exception:
+        pass
+
+
+_SETTINGS = load_settings()
 
 
 # base image type
@@ -437,6 +499,19 @@ def write_g4(image, layer, filename, folder, dithering, exp_pal, skip_index0, tr
     @param interlaced: double vertical resolution (two pages)
     '''
     try:
+        tc = tuple(trans_color) if trans_color else (255, 0, 255)
+        save_settings({
+            "filename": filename,
+            "folder": folder,
+            "screen_mode": screen_mode,
+            "interlaced": int(interlaced),
+            "dithering": int(dithering),
+            "export_pal": int(exp_pal),
+            "skip_index0": int(skip_index0),
+            "trans_color": [int(tc[0]), int(tc[1]), int(tc[2])],
+            "encoding": encoding,
+            "pal_file": int(paltxt_file),
+        })
         do_write_g4(image, layer, filename, folder, dithering, exp_pal, skip_index0, trans_color, encoding, paltxt_file, screen_mode, interlaced)
     except Exception:
         gimp.message(traceback.format_exc())
@@ -458,6 +533,20 @@ def write_g4_alpha(image, layer, filename, folder, dithering, exp_pal, encoding,
     @param interlaced: double vertical resolution (two pages)
     '''
     try:
+        # keep last used transparent color for non-alpha dialog; alpha uses image alpha
+        prev = load_settings()
+        save_settings({
+            "filename": filename,
+            "folder": folder,
+            "screen_mode": screen_mode,
+            "interlaced": int(interlaced),
+            "dithering": int(dithering),
+            "export_pal": int(exp_pal),
+            "skip_index0": 1,
+            "trans_color": prev.get("trans_color", [255, 0, 255]),
+            "encoding": encoding,
+            "pal_file": int(paltxt_file),
+        })
         do_write_g4(image, layer, filename, folder, dithering, exp_pal, True, None, encoding, paltxt_file, screen_mode, interlaced)
     except Exception:
         gimp.message(traceback.format_exc())
@@ -469,25 +558,25 @@ gimpfu.register("msx_g4_exporter",
                 "Pedro de Medeiros", "Pedro de Medeiros", "2021-2025",
                 "<Image>/Filters/MSX/Export GRAPHICS 4 bitmap...",
                 "RGB*, INDEXED*, GRAY*", [
-                    (gimpfu.PF_STRING, "filename", "File name", DEFAULT_FILENAME),
-                    (gimpfu.PF_DIRNAME, "folder", "Output Folder", DEFAULT_OUTPUT_DIR),
-                    (gimpfu.PF_BOOL, "dithering", "Dithering", True),
-                    (gimpfu.PF_BOOL, "exp-pal", "Export palette", False),
-                    (gimpfu.PF_BOOL, "skip_index0", "Reserve index 0 for transparency", True),
-                    (gimpfu.PF_COLOR, "trans_color", "Input transparent color", (0xff, 0x0, 0xff)),
-                    (gimpfu.PF_RADIO, "screen-mode", "Screen mode", SCREEN5,
+                    (gimpfu.PF_STRING, "filename", "File name", _SETTINGS["filename"]),
+                    (gimpfu.PF_DIRNAME, "folder", "Output Folder", _SETTINGS["folder"]),
+                    (gimpfu.PF_BOOL, "dithering", "Dithering", bool(_SETTINGS["dithering"])),
+                    (gimpfu.PF_BOOL, "exp-pal", "Export palette", bool(_SETTINGS["export_pal"])),
+                    (gimpfu.PF_BOOL, "skip_index0", "Reserve index 0 for transparency", bool(_SETTINGS["skip_index0"])),
+                    (gimpfu.PF_COLOR, "trans_color", "Input transparent color", tuple(_SETTINGS["trans_color"])),
+                    (gimpfu.PF_RADIO, "screen-mode", "Screen mode", _SETTINGS["screen_mode"],
                        (("SCREEN5", SCREEN5),
                         ("SCREEN7", SCREEN7))),
-                    (gimpfu.PF_RADIO, "interlaced", "Interlaced", 0,
+                    (gimpfu.PF_RADIO, "interlaced", "Interlaced", _SETTINGS["interlaced"],
                        (("Off", 0),
                         ("On", 1))),
-                    (gimpfu.PF_RADIO, "image-enc", "Image Encoding", DEFAULT_OUTPUT_FMT,
+                    (gimpfu.PF_RADIO, "image-enc", "Image Encoding", _SETTINGS["encoding"],
                        (("Binary format with palette (SCn)", "SC"),
                         ("Binary format without palette (SRn)", "SR"),
                         ("MSX-BASIC COPY to disk (no palette)", "DAT"),
                         ("Raw file (no palette)", "RAW"),
                         ("No output (image in new window)", "no-output"))),
-                    (gimpfu.PF_BOOL, "paltxt_file", "Export plain text palette", False)
+                    (gimpfu.PF_BOOL, "paltxt_file", "Export plain text palette", bool(_SETTINGS["pal_file"]))
                 ],
                 [],
                 write_g4)
@@ -498,23 +587,23 @@ gimpfu.register("msx_g4_exporter_alpha",
                 "Pedro de Medeiros", "Pedro de Medeiros", "2021-2025",
                 "<Image>/Filters/MSX/Export GRAPHICS 4 bitmap (with alpha channel)...",
                 "RGBA, INDEXEDA, GRAYA", [
-                    (gimpfu.PF_STRING, "filename", "File name", DEFAULT_FILENAME),
-                    (gimpfu.PF_DIRNAME, "folder", "Output Folder", DEFAULT_OUTPUT_DIR),
-                    (gimpfu.PF_BOOL, "dithering", "Dithering", True),
-                    (gimpfu.PF_BOOL, "exp-pal", "Export palette", False),
-                    (gimpfu.PF_RADIO, "screen-mode", "Screen mode", SCREEN5,
+                    (gimpfu.PF_STRING, "filename", "File name", _SETTINGS["filename"]),
+                    (gimpfu.PF_DIRNAME, "folder", "Output Folder", _SETTINGS["folder"]),
+                    (gimpfu.PF_BOOL, "dithering", "Dithering", bool(_SETTINGS["dithering"])),
+                    (gimpfu.PF_BOOL, "exp-pal", "Export palette", bool(_SETTINGS["export_pal"])),
+                    (gimpfu.PF_RADIO, "screen-mode", "Screen mode", _SETTINGS["screen_mode"],
                        (("SCREEN5", SCREEN5),
                         ("SCREEN7", SCREEN7))),
-                    (gimpfu.PF_RADIO, "interlaced", "Interlaced", 0,
+                    (gimpfu.PF_RADIO, "interlaced", "Interlaced", _SETTINGS["interlaced"],
                        (("Off", 0),
                         ("On", 1))),
-                    (gimpfu.PF_RADIO, "image-enc", "Image Encoding", DEFAULT_OUTPUT_FMT,
+                    (gimpfu.PF_RADIO, "image-enc", "Image Encoding", _SETTINGS["encoding"],
                        (("Binary format with palette (SCn)", "SC"),
                         ("Binary format without palette (SRn)", "SR"),
                         ("MSX-BASIC COPY to disk (no palette)", "DAT"),
                         ("Raw file (no palette)", "RAW"),
                         ("No output (image in new window)", "no-output"))),
-                    (gimpfu.PF_BOOL, "paltxt-file", "Export plain text palette", False)
+                    (gimpfu.PF_BOOL, "paltxt-file", "Export plain text palette", bool(_SETTINGS["pal_file"]))
                 ],
                 [],
                 write_g4_alpha)

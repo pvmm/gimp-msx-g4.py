@@ -33,6 +33,7 @@ from pprint import pprint
 
 import os
 import sys
+import json
 import struct
 import threading
 import traceback
@@ -45,6 +46,64 @@ MAX_DAT_HEIGHT = 212
 ENC_GROUP = {0: "SC", 1: "SR", 2: "DAT", 3: "RAW", 4: "no-output" }
 BIN_PREFIX = 0xFE
 DEFAULT_FILENAME = 'NONAME'
+
+SETTINGS_FILE = "msx-g4-settings.json"
+
+
+def _settings_path():
+    return os.path.join(Gimp.directory(), SETTINGS_FILE)
+
+
+def load_settings():
+    defaults = {
+        "filename": DEFAULT_FILENAME,
+        "folder": os.getcwd(),
+        "screen_mode": SCREEN5,
+        "interlaced": 0,
+        "dithering": 1,
+        "export_pal": 1,
+        "skip_index0": 1,
+        "trans_color": [255, 0, 255, 255],
+        "encoding": "SC",
+        "pal_file": 0,
+    }
+    try:
+        with open(_settings_path(), "r") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            defaults.update({k: data[k] for k in defaults if k in data})
+    except Exception:
+        pass
+    # normalize
+    if defaults.get("screen_mode") not in (SCREEN5, SCREEN7):
+        defaults["screen_mode"] = SCREEN5
+    if defaults.get("encoding") not in ENC_GROUP:
+        defaults["encoding"] = "SC"
+    tc = defaults.get("trans_color")
+    if not (isinstance(tc, (list, tuple)) and len(tc) >= 3):
+        defaults["trans_color"] = [255, 0, 255, 255]
+    else:
+        defaults["trans_color"] = [int(tc[0]), int(tc[1]), int(tc[2]), int(tc[3]) if len(tc) > 3 else 255]
+    for key in ("interlaced", "dithering", "export_pal", "skip_index0", "pal_file"):
+        defaults[key] = int(bool(defaults.get(key, 0)))
+    folder = defaults.get("folder")
+    if not isinstance(folder, str) or not os.path.isdir(folder):
+        defaults["folder"] = os.getcwd()
+    name = defaults.get("filename")
+    if not isinstance(name, str) or not name:
+        defaults["filename"] = DEFAULT_FILENAME
+    return defaults
+
+
+def save_settings(settings):
+    try:
+        path = _settings_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(settings, f, indent=2, sort_keys=True)
+    except Exception:
+        pass
+
 
 # screen modes
 SCREEN5 = "SCREEN5"
@@ -437,6 +496,8 @@ class Graph4Exporter (Gimp.PlugIn):
 
             GimpUi.init("msx-graph4-exporter")
 
+            settings = load_settings()
+
             dialog = Gtk.Dialog(
                 title="MSX Graphics 4 Image Converter Options",
                 use_header_bar=True,
@@ -460,7 +521,7 @@ class Graph4Exporter (Gimp.PlugIn):
             file_label = Gtk.Label(label="File name")
             file_label.set_halign(Gtk.Align.END)
             file_entry = Gtk.Entry()
-            file_entry.set_text(DEFAULT_FILENAME)
+            file_entry.set_text(settings["filename"])
             grid.attach(file_label, 0, 0, 1, 1)
             grid.attach(file_entry, 1, 0, 1, 1)
 
@@ -468,7 +529,7 @@ class Graph4Exporter (Gimp.PlugIn):
             folder_label = Gtk.Label(label="Output folder")
             folder_label.set_halign(Gtk.Align.END)
             folder_button = Gtk.FileChooserButton(title="Choose a folder", action=Gtk.FileChooserAction.SELECT_FOLDER)
-            folder_button.set_current_folder(os.getcwd())
+            folder_button.set_current_folder(settings["folder"])
             grid.attach(folder_label, 0, 1, 1, 1)
             grid.attach(folder_button, 1, 1, 1, 1)
 
@@ -478,7 +539,7 @@ class Graph4Exporter (Gimp.PlugIn):
             screen_combo = Gtk.ComboBoxText()
             screen_combo.append_text("SCREEN5")
             screen_combo.append_text("SCREEN7")
-            screen_combo.set_active(0)
+            screen_combo.set_active(0 if settings["screen_mode"] == SCREEN5 else 1)
             grid.attach(screen_label, 0, 2, 1, 1)
             grid.attach(screen_combo, 1, 2, 1, 1)
 
@@ -488,7 +549,7 @@ class Graph4Exporter (Gimp.PlugIn):
             interlaced_combo = Gtk.ComboBoxText()
             interlaced_combo.append_text("Off")
             interlaced_combo.append_text("On")
-            interlaced_combo.set_active(0)
+            interlaced_combo.set_active(settings["interlaced"])
             grid.attach(interlaced_label, 0, 3, 1, 1)
             grid.attach(interlaced_combo, 1, 3, 1, 1)
 
@@ -498,7 +559,7 @@ class Graph4Exporter (Gimp.PlugIn):
             dithering_combo = Gtk.ComboBoxText()
             dithering_combo.append_text("Off")
             dithering_combo.append_text("On")
-            dithering_combo.set_active(1)
+            dithering_combo.set_active(settings["dithering"])
             grid.attach(dithering_label, 0, 4, 1, 1)
             grid.attach(dithering_combo, 1, 4, 1, 1)
 
@@ -508,7 +569,7 @@ class Graph4Exporter (Gimp.PlugIn):
             export_combo = Gtk.ComboBoxText()
             export_combo.append_text("Off")
             export_combo.append_text("On")
-            export_combo.set_active(1)
+            export_combo.set_active(settings["export_pal"])
             grid.attach(export_label, 0, 5, 1, 1)
             grid.attach(export_combo, 1, 5, 1, 1)
 
@@ -518,7 +579,7 @@ class Graph4Exporter (Gimp.PlugIn):
             index0_combo = Gtk.ComboBoxText()
             index0_combo.append_text("Off")
             index0_combo.append_text("On")
-            index0_combo.set_active(1)
+            index0_combo.set_active(settings["skip_index0"])
             grid.attach(index0_label, 0, 6, 1, 1)
             grid.attach(index0_combo, 1, 6, 1, 1)
 
@@ -527,7 +588,11 @@ class Graph4Exporter (Gimp.PlugIn):
             trans_label.set_halign(Gtk.Align.END)
             trans_button = Gtk.ColorButton()
             default_color = Gdk.RGBA()
-            default_color.parse("#ff00ff")
+            tc = settings["trans_color"]
+            default_color.red = tc[0] / 255.0
+            default_color.green = tc[1] / 255.0
+            default_color.blue = tc[2] / 255.0
+            default_color.alpha = (tc[3] if len(tc) > 3 else 255) / 255.0
             trans_button.set_rgba(default_color)
             grid.attach(trans_label, 0, 7, 1, 1)
             grid.attach(trans_button, 1, 7, 1, 1)
@@ -546,6 +611,10 @@ class Graph4Exporter (Gimp.PlugIn):
             radio_box.pack_start(radio3, False, False, 0)
             radio_box.pack_start(radio4, False, False, 0)
             radio_box.pack_start(radio5, False, False, 0)
+            try:
+                radio_box.get_children()[ENC_GROUP.index(settings["encoding"])].set_active(True)
+            except Exception:
+                radio1.set_active(True)
             grid.attach(radio_label, 0, 8, 1, 1)
             grid.attach(radio_box, 1, 8, 1, 1)
 
@@ -555,12 +624,14 @@ class Graph4Exporter (Gimp.PlugIn):
             pal_combo = Gtk.ComboBoxText()
             pal_combo.append_text("Off")
             pal_combo.append_text("On")
-            pal_combo.set_active(0)
+            pal_combo.set_active(settings["pal_file"])
             grid.attach(pal_label, 0, 9, 1, 1)
             grid.attach(pal_combo, 1, 9, 1, 1)
 
             # Connect the index0 "changed" signal to trans_button
             index0_combo.connect("changed", on_combo_changed, trans_button)
+            # apply initial sensitivity
+            trans_button.set_sensitive(bool(index0_combo.get_active()))
 
             dialog.show_all()
             response = dialog.run()
@@ -568,7 +639,7 @@ class Graph4Exporter (Gimp.PlugIn):
                 # keep current dialog around
                 [item.set_sensitive(False) for item in grid.get_children()]
                 file_value = file_entry.get_text()
-                folder_value = folder_button.get_filename()
+                folder_value = folder_button.get_filename() or settings["folder"]
                 screen_value = [SCREEN5, SCREEN7][screen_combo.get_active()]
                 interlaced_value = bool(interlaced_combo.get_active())
                 dithering_value = dithering_combo.get_active()
@@ -577,6 +648,18 @@ class Graph4Exporter (Gimp.PlugIn):
                 trans_color = denormalize(trans_button.get_rgba())
                 encoding_value = ENC_GROUP[[item.get_active() for item in radio_box.get_children()].index(1)]
                 pal_value = pal_combo.get_active()
+                save_settings({
+                    "filename": file_value,
+                    "folder": folder_value,
+                    "screen_mode": screen_value,
+                    "interlaced": int(interlaced_value),
+                    "dithering": dithering_value,
+                    "export_pal": export_value,
+                    "skip_index0": index0_value,
+                    "trans_color": list(trans_color),
+                    "encoding": encoding_value,
+                    "pal_file": pal_value,
+                })
                 dialog.destroy()
 
                 # progress dialog will bock
