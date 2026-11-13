@@ -268,17 +268,41 @@ def do_write_g4(image, layer, filename, folder, dithering, exp_pal, skip_index0,
         if encoding == 'SC':
             for pos in range(2 * MAX_COLORS):
                 buffer[palette_offset + pos] = pal9bits[pos]
+
+        # Interlaced SCREEN 7 does not fit in the 16-bit range of a single BSAVE
+        # file (2 x 64K pages), so it is split into two files: page 0 (.S70/.R70)
+        # and page 1 (.S71/.R71).
+        split_sc7 = interlaced and screen_mode == "SCREEN7" and encoding in ('SC', 'SR')
+
         if encoding == 'RAW':
             encoded = struct.pack('<{}B'.format(len(buffer)), *buffer)
+            file = open(os.path.join(folder, '%s.%s' % (filename, extension)), 'wb')
+            file.write(encoded)
+            file.close()
         elif encoding == 'DAT':
             encoded = struct.pack('<HH{}B'.format(len(buffer)), connector.width, connector.height, *buffer)
+            file = open(os.path.join(folder, '%s.%s' % (filename, extension)), 'wb')
+            file.write(encoded)
+            file.close()
+        elif split_sc7:
+            page0 = buffer[0:page_size]
+            page1 = buffer[page_size:page_size * 2]
+            if encoding == 'SC':
+                ext0, ext1 = 'S70', 'S71'
+            else:
+                ext0, ext1 = 'R70', 'R71'
+            for ext, page in ((ext0, page0), (ext1, page1)):
+                encoded = struct.pack('<BHHH{}B'.format(len(page)), BIN_PREFIX, 0, len(page) - 1, 0, *page)
+                f = open(os.path.join(folder, '%s.%s' % (filename, ext)), 'wb')
+                f.write(encoded)
+                f.close()
         else:
             # the end address of a BSAVE file is limited to 16 bits
             end = min(len(buffer) - 1, 0xFFFF)
             encoded = struct.pack('<BHHH{}B'.format(len(buffer)), BIN_PREFIX, 0, end, 0, *buffer)
-        file = open(os.path.join(folder, '%s.%s' % (filename, extension)), 'wb')
-        file.write(encoded)
-        file.close()
+            file = open(os.path.join(folder, '%s.%s' % (filename, extension)), 'wb')
+            file.write(encoded)
+            file.close()
         gimp.delete(new_image)
     else:
         for y in range(0, connector.height):
@@ -454,7 +478,9 @@ gimpfu.register("msx_g4_exporter",
                     (gimpfu.PF_RADIO, "screen-mode", "Screen mode", SCREEN5,
                        (("SCREEN5", SCREEN5),
                         ("SCREEN7", SCREEN7))),
-                    (gimpfu.PF_BOOL, "interlaced", "Interlaced (double vertical resolution)", False),
+                    (gimpfu.PF_RADIO, "interlaced", "Interlaced", 0,
+                       (("Off", 0),
+                        ("On", 1))),
                     (gimpfu.PF_RADIO, "image-enc", "Image Encoding", DEFAULT_OUTPUT_FMT,
                        (("Binary format with palette (SCn)", "SC"),
                         ("Binary format without palette (SRn)", "SR"),
@@ -479,7 +505,9 @@ gimpfu.register("msx_g4_exporter_alpha",
                     (gimpfu.PF_RADIO, "screen-mode", "Screen mode", SCREEN5,
                        (("SCREEN5", SCREEN5),
                         ("SCREEN7", SCREEN7))),
-                    (gimpfu.PF_BOOL, "interlaced", "Interlaced (double vertical resolution)", False),
+                    (gimpfu.PF_RADIO, "interlaced", "Interlaced", 0,
+                       (("Off", 0),
+                        ("On", 1))),
                     (gimpfu.PF_RADIO, "image-enc", "Image Encoding", DEFAULT_OUTPUT_FMT,
                        (("Binary format with palette (SCn)", "SC"),
                         ("Binary format without palette (SRn)", "SR"),

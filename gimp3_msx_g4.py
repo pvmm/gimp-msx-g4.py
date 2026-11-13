@@ -76,7 +76,7 @@ class NoTransparentColorError(Exception): pass
 
 
 def on_combo_changed(combo, affected_element):
-    affected_element.set_sensitive(False if combo.get_active() == 1 else True)
+    affected_element.set_sensitive(bool(combo.get_active()))
 
 
 def on_radio_toggled(radio, affected_element):
@@ -358,16 +358,36 @@ def do_convert(connector, filename, folder, dithering, export_pal, skip_index0, 
             for pos in range(2 * MAX_COLORS):
                 buffer[palette_offset + pos] = pal9bits[pos]
 
+        # Interlaced SCREEN 7 does not fit in the 16-bit range of a single BSAVE
+        # file (2 x 64K pages), so it is split into two files: page 0 (.S70/.R70)
+        # and page 1 (.S71/.R71).
+        split_sc7 = interlaced and screen_mode == "SCREEN7" and encoding in ('SC', 'SR')
+
         if encoding == 'RAW':
             encoded = struct.pack('<{}B'.format(len(buffer)), *buffer)
+            with open(os.path.join(folder, '%s.%s' % (filename, extension)), 'wb') as file:
+                file.write(encoded)
         elif encoding == 'DAT':
             encoded = struct.pack('<HH{}B'.format(len(buffer)), connector.width, connector.height, *buffer)
+            with open(os.path.join(folder, '%s.%s' % (filename, extension)), 'wb') as file:
+                file.write(encoded)
+        elif split_sc7:
+            page0 = buffer[0:page_size]
+            page1 = buffer[page_size:page_size * 2]
+            if encoding == 'SC':
+                ext0, ext1 = 'S70', 'S71'
+            else:
+                ext0, ext1 = 'R70', 'R71'
+            for ext, page in ((ext0, page0), (ext1, page1)):
+                encoded = struct.pack('<BHHH{}B'.format(len(page)), BIN_PREFIX, 0, len(page) - 1, 0, *page)
+                with open(os.path.join(folder, '%s.%s' % (filename, ext)), 'wb') as file:
+                    file.write(encoded)
         else:
             # the end address of a BSAVE file is limited to 16 bits
             end = min(len(buffer) - 1, 0xFFFF)
             encoded = struct.pack('<BHHH{}B'.format(len(buffer)), BIN_PREFIX, 0, end, 0, *buffer)
-        with open(os.path.join(folder, '%s.%s' % (filename, extension)), 'wb') as file:
-            file.write(encoded)
+            with open(os.path.join(folder, '%s.%s' % (filename, extension)), 'wb') as file:
+                file.write(encoded)
         # Doing this instead of returning
         connector.set_progress(status=(SUCCESS, None))
 
@@ -462,6 +482,16 @@ class Graph4Exporter (Gimp.PlugIn):
             grid.attach(screen_label, 0, 2, 1, 1)
             grid.attach(screen_combo, 1, 2, 1, 1)
 
+            # Interlaced combo box
+            interlaced_label = Gtk.Label(label="Interlaced")
+            interlaced_label.set_halign(Gtk.Align.END)
+            interlaced_combo = Gtk.ComboBoxText()
+            interlaced_combo.append_text("Off")
+            interlaced_combo.append_text("On")
+            interlaced_combo.set_active(0)
+            grid.attach(interlaced_label, 0, 3, 1, 1)
+            grid.attach(interlaced_combo, 1, 3, 1, 1)
+
             # Dithering combo box
             dithering_label = Gtk.Label(label="Dithering")
             dithering_label.set_halign(Gtk.Align.END)
@@ -469,8 +499,8 @@ class Graph4Exporter (Gimp.PlugIn):
             dithering_combo.append_text("Off")
             dithering_combo.append_text("On")
             dithering_combo.set_active(1)
-            grid.attach(dithering_label, 0, 3, 1, 1)
-            grid.attach(dithering_combo, 1, 3, 1, 1)
+            grid.attach(dithering_label, 0, 4, 1, 1)
+            grid.attach(dithering_combo, 1, 4, 1, 1)
 
             # Export palette combo box
             export_label = Gtk.Label(label="Export palette")
@@ -479,8 +509,8 @@ class Graph4Exporter (Gimp.PlugIn):
             export_combo.append_text("Off")
             export_combo.append_text("On")
             export_combo.set_active(1)
-            grid.attach(export_label, 0, 4, 1, 1)
-            grid.attach(export_combo, 1, 4, 1, 1)
+            grid.attach(export_label, 0, 5, 1, 1)
+            grid.attach(export_combo, 1, 5, 1, 1)
 
             # Reserve index 0 as transparency
             index0_label = Gtk.Label(label="Reserve index 0 as transparency")
@@ -489,8 +519,8 @@ class Graph4Exporter (Gimp.PlugIn):
             index0_combo.append_text("Off")
             index0_combo.append_text("On")
             index0_combo.set_active(1)
-            grid.attach(index0_label, 0, 5, 1, 1)
-            grid.attach(index0_combo, 1, 5, 1, 1)
+            grid.attach(index0_label, 0, 6, 1, 1)
+            grid.attach(index0_combo, 1, 6, 1, 1)
 
             # Color picker
             trans_label = Gtk.Label(label="Input transparent color")
@@ -499,8 +529,8 @@ class Graph4Exporter (Gimp.PlugIn):
             default_color = Gdk.RGBA()
             default_color.parse("#ff00ff")
             trans_button.set_rgba(default_color)
-            grid.attach(trans_label, 0, 6, 1, 1)
-            grid.attach(trans_button, 1, 6, 1, 1)
+            grid.attach(trans_label, 0, 7, 1, 1)
+            grid.attach(trans_button, 1, 7, 1, 1)
 
             # Radio button group
             radio_label = Gtk.Label(label="Image encoding")
@@ -516,29 +546,21 @@ class Graph4Exporter (Gimp.PlugIn):
             radio_box.pack_start(radio3, False, False, 0)
             radio_box.pack_start(radio4, False, False, 0)
             radio_box.pack_start(radio5, False, False, 0)
+            grid.attach(radio_label, 0, 8, 1, 1)
+            grid.attach(radio_box, 1, 8, 1, 1)
 
-            # Interlaced mode: even lines in page 0, odd lines in page 1
-            interlaced_check = Gtk.CheckButton(label="Interlaced (double vertical resolution)")
-            enc_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
-            enc_box.pack_start(radio_box, False, False, 0)
-            enc_box.pack_start(interlaced_check, False, False, 0)
-            grid.attach(radio_label, 0, 7, 1, 1)
-            grid.attach(enc_box, 1, 7, 1, 1)
-
-            # Reserve index 0 as transparency
+            # Export plain text palette
             pal_label = Gtk.Label(label="Export plain text palette")
             pal_label.set_halign(Gtk.Align.END)
             pal_combo = Gtk.ComboBoxText()
             pal_combo.append_text("Off")
             pal_combo.append_text("On")
             pal_combo.set_active(0)
-            grid.attach(pal_label, 0, 8, 1, 1)
-            grid.attach(pal_combo, 1, 8, 1, 1)
+            grid.attach(pal_label, 0, 9, 1, 1)
+            grid.attach(pal_combo, 1, 9, 1, 1)
 
             # Connect the index0 "changed" signal to trans_button
             index0_combo.connect("changed", on_combo_changed, trans_button)
-            # the interlaced option is useless when there is no output
-            radio5.connect("toggled", on_radio_toggled, interlaced_check)
 
             dialog.show_all()
             response = dialog.run()
@@ -548,12 +570,12 @@ class Graph4Exporter (Gimp.PlugIn):
                 file_value = file_entry.get_text()
                 folder_value = folder_button.get_filename()
                 screen_value = [SCREEN5, SCREEN7][screen_combo.get_active()]
+                interlaced_value = bool(interlaced_combo.get_active())
                 dithering_value = dithering_combo.get_active()
                 export_value = export_combo.get_active()
                 index0_value = index0_combo.get_active()
                 trans_color = denormalize(trans_button.get_rgba())
                 encoding_value = ENC_GROUP[[item.get_active() for item in radio_box.get_children()].index(1)]
-                interlaced_value = interlaced_check.get_active()
                 pal_value = pal_combo.get_active()
                 dialog.destroy()
 
