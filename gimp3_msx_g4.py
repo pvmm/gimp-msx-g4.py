@@ -41,14 +41,19 @@ import traceback
 # constants
 NOTRANS = (None, None, None, None)  # ignored, use a colour that will never match
 MAX_COLORS = 16
-MAX_WIDTH = 256
-MAX_HEIGHT = 256
-MAX_PAGES = 4
-ENC_GROUP = {0: "SC5", 1: "SR5", 2: "DAT", 3: "RAW", 4: "no-output" }
+MAX_DAT_HEIGHT = 212
+ENC_GROUP = {0: "SC", 1: "SR", 2: "DAT", 3: "RAW", 4: "no-output" }
 BIN_PREFIX = 0xFE
 DEFAULT_FILENAME = 'NONAME'
-PALETTE_OFFSET = 0x7680
-LAST_PALETTE_POS = 0x76a0
+
+# screen modes
+SCREEN5 = "SCREEN5"
+SCREEN7 = "SCREEN7"
+# width, bytes per line, page size in bytes, palette offset, file name suffix
+SCREEN_MODES = {
+    SCREEN5: {"width": 256, "line_size": 128, "page_size": 0x8000, "palette_offset": 0x7680, "suffix": "5"},
+    SCREEN7: {"width": 512, "line_size": 256, "page_size": 0x10000, "palette_offset": 0xFA80, "suffix": "7"},
+}
 
 # exit status results
 UNFINISHED = -1
@@ -72,6 +77,11 @@ class NoTransparentColorError(Exception): pass
 
 def on_combo_changed(combo, affected_element):
     affected_element.set_sensitive(False if combo.get_active() == 1 else True)
+
+
+def on_radio_toggled(radio, affected_element):
+    """Disable the affected element when the radio button is selected."""
+    affected_element.set_sensitive(False if radio.get_active() else True)
 
 
 def denormalize(color):
@@ -211,8 +221,16 @@ def convert(connector, *args):
         message = ''.join(traceback.format_exception(type(e), e, e.__traceback__))
         connector.throw(message)
 
-def do_convert(connector, filename, folder, dithering, export_pal, skip_index0, trans_color, encoding, pal_file):
+def do_convert(connector, filename, folder, dithering, export_pal, skip_index0, trans_color, encoding, pal_file, screen_mode, interlaced):
     global _
+    mode = SCREEN_MODES[screen_mode]
+    width = mode["width"]
+    line_size = mode["line_size"]
+    page_size = mode["page_size"]
+    palette_offset = mode["palette_offset"]
+    # file name suffix: SC5/SC7, SR5/SR7, DAT, RAW
+    extension = encoding if encoding in ("DAT", "RAW", "no-output") else encoding + mode["suffix"]
+
     # transparent color ignored if not required
     if not skip_index0:
         trans_color = NOTRANS
@@ -220,15 +238,21 @@ def do_convert(connector, filename, folder, dithering, export_pal, skip_index0, 
     else:
         max_colors = MAX_COLORS - 1
 
-    if not encoding in ("DAT", "no-output") and connector.width != MAX_WIDTH:
-        raise ImageFormatError(_("Width should be exactly 256 (currently {}) for this image type.").format(connector.width))
-    elif encoding != "no-output" and connector.width > MAX_WIDTH:
-        raise ImageFormatError(_("Width should not be greater than 256 (currently {}) for this image type.").format(connector.width))
-    elif encoding != "no-output" and connector.height > MAX_HEIGHT:
-        raise ImageFormatError(_("Height should not be greater than 256 (currently {}) for this image type.").format(connector.height))
+    # interlaced images are split in two pages: even lines in page 0, odd lines in page 1
+    pages = 2 if interlaced else 1
+    max_height = (page_size // line_size) * pages
 
-    if connector.height > MAX_HEIGHT * MAX_PAGES:
-        raise ImageFormatError(_("Height must not be greater than {}.").format(MAX_HEIGHT * MAX_PAGES))
+    if encoding != "no-output":
+        if encoding != "DAT" and connector.width != width:
+            raise ImageFormatError(_("Width should be exactly {} (currently {}) for this image type.").format(width, connector.width))
+        elif connector.width > width:
+            raise ImageFormatError(_("Width should not be greater than {} (currently {}) for this image type.").format(width, connector.width))
+        elif connector.height > max_height:
+            raise ImageFormatError(_("Height should not be greater than {} (currently {}) for this image type.").format(max_height, connector.height))
+        elif interlaced and connector.height % 2:
+            raise ImageFormatError(_("Height should be even (currently {}) for interlaced images.").format(connector.height))
+        elif encoding == "DAT" and connector.height > MAX_DAT_HEIGHT * pages:
+            raise ImageFormatError(_("Height should not be greater than {} (currently {}) for this image type.").format(MAX_DAT_HEIGHT * pages, connector.height))
 
     # create palette data
     pal9bits = [0] * 2 * MAX_COLORS
@@ -255,12 +279,12 @@ def do_convert(connector, filename, folder, dithering, export_pal, skip_index0, 
         txtpal[i] = (r >> 5, g >> 5, b >> 5)
 
     if export_pal:
-        encoded = struct.pack('<BHHH{}B'.format(len(pal9bits)), BIN_PREFIX, PALETTE_OFFSET,
-                PALETTE_OFFSET + len(pal9bits), 0, *pal9bits[0:len(pal9bits)])
+        encoded = struct.pack('<BHHH{}B'.format(len(pal9bits)), BIN_PREFIX, palette_offset,
+                palette_offset + len(pal9bits) - 1, 0, *pal9bits[0:len(pal9bits)])
         with open(os.path.join(folder, '%s.PAL' % filename), 'wb') as file:
             file.write(encoded)
 
-    connector.set_progress(text=_("Exporting image to {} format...").format(_(encoding)))
+    connector.set_progress(text=_("Exporting image to {} format...").format(_(extension)))
 
     if encoding == 'no-output':
         # Export 16 color palette
@@ -284,16 +308,27 @@ def do_convert(connector, filename, folder, dithering, export_pal, skip_index0, 
         # Export MSX2 palette
         if pal_file:
             with open(os.path.join(folder, '%s.TXT' % filename), 'wt') as file:
-                print("SCREEN 5 palette:", file=file)
+                print("%s palette:" % screen_mode, file=file)
                 for i, (r, g, b) in enumerate(txtpal):
                     print('%i: %i, %i, %i' % (i, r, g, b), file=file)
 
+        # line size may vary for the MSX-BASIC COPY format
+        stride = connector.width // 2 if encoding == 'DAT' else line_size
+        # number of lines stored in each page
+        page_lines = (connector.height + 1) // 2 if interlaced else connector.height
+
         # complete buffer
-        if encoding == 'SC5':
+        if encoding in ('RAW', 'DAT'):
+            # raw files pack both pages together
+            buffer = [0] * (stride * page_lines * pages)
+        elif interlaced:
+            # interlaced binary files keep the two pages apart
+            buffer = [0] * max(page_size * pages, palette_offset + 2 * MAX_COLORS)
+        elif encoding == 'SC':
             # make sure to save space for inner palette
-            buffer = [0] * max(LAST_PALETTE_POS, (connector.width // 2) * connector.height)
+            buffer = [0] * max(palette_offset + 2 * MAX_COLORS, stride * page_lines)
         else:
-            buffer = [0] * (connector.width // 2) * connector.height
+            buffer = [0] * (stride * page_lines)
 
         for y in range(connector.height):
             for x in range(connector.width):
@@ -303,23 +338,35 @@ def do_convert(connector, filename, folder, dithering, export_pal, skip_index0, 
                     index = 0
                 else:
                     index, ignored = query((c[0], c[1], c[2]))
-                    index += skip_index0
-                pos = x // 2 + y * (connector.width // 2)
+                    # index 0 is reserved for transparency only if it is used
+                    index += 1 if used_transparency else 0
+                if interlaced:
+                    # even lines go to page 0, odd lines go to page 1
+                    if encoding in ('RAW', 'DAT'):
+                        # raw files pack both pages together
+                        pos = (y // 2) * stride if y % 2 == 0 else (page_lines + y // 2) * stride
+                    else:
+                        pos = (y % 2) * page_size + (y // 2) * stride
+                else:
+                    pos = y * stride
+                pos += x // 2
                 buffer[pos] |= index if x % 2 else index << 4;
             connector.set_progress(y/connector.height)
 
-        # Embed palette into image data (SC5 only)
-        if encoding == 'SC5':
-            for pos in range(32):
-                buffer[0x7680 + pos] = pal9bits[pos]
+        # Embed palette into image data (SC only)
+        if encoding == 'SC':
+            for pos in range(2 * MAX_COLORS):
+                buffer[palette_offset + pos] = pal9bits[pos]
 
         if encoding == 'RAW':
             encoded = struct.pack('<{}B'.format(len(buffer)), *buffer)
         elif encoding == 'DAT':
-            encoded = struct.pack('<HH{}B'.format(connector.width * connector.height // 2), connector.width, connector.height, *buffer)
+            encoded = struct.pack('<HH{}B'.format(len(buffer)), connector.width, connector.height, *buffer)
         else:
-            encoded = struct.pack('<BHHH{}B'.format(len(buffer)), BIN_PREFIX, 0, len(buffer), 0, *buffer)
-        with open(os.path.join(folder, '%s.%s' % (filename, encoding)), 'wb') as file:
+            # the end address of a BSAVE file is limited to 16 bits
+            end = min(len(buffer) - 1, 0xFFFF)
+            encoded = struct.pack('<BHHH{}B'.format(len(buffer)), BIN_PREFIX, 0, end, 0, *buffer)
+        with open(os.path.join(folder, '%s.%s' % (filename, extension)), 'wb') as file:
             file.write(encoded)
         # Doing this instead of returning
         connector.set_progress(status=(SUCCESS, None))
@@ -347,7 +394,7 @@ class Graph4Exporter (Gimp.PlugIn):
         procedure.add_menu_path('<Image>/Filters/MSX/')
 
         procedure.set_documentation(_("MSX2 Graphics 4 Image Converter"),
-                                    _("Converts image into a MSX2 graphics 4 (SCREEN 5) binary according to the VRAM layout"),
+                                    _("Converts image into a MSX2 graphics 4 (SCREEN 5) or graphics 5 (SCREEN 7) binary according to the VRAM layout"),
                                     name)
         procedure.set_attribution("Pedro de Medeiros", "© Pedro de Medeiros, 2025", "2025")
 
@@ -405,6 +452,16 @@ class Graph4Exporter (Gimp.PlugIn):
             grid.attach(folder_label, 0, 1, 1, 1)
             grid.attach(folder_button, 1, 1, 1, 1)
 
+            # Screen mode combo box
+            screen_label = Gtk.Label(label="Screen mode")
+            screen_label.set_halign(Gtk.Align.END)
+            screen_combo = Gtk.ComboBoxText()
+            screen_combo.append_text("SCREEN5")
+            screen_combo.append_text("SCREEN7")
+            screen_combo.set_active(0)
+            grid.attach(screen_label, 0, 2, 1, 1)
+            grid.attach(screen_combo, 1, 2, 1, 1)
+
             # Dithering combo box
             dithering_label = Gtk.Label(label="Dithering")
             dithering_label.set_halign(Gtk.Align.END)
@@ -412,8 +469,8 @@ class Graph4Exporter (Gimp.PlugIn):
             dithering_combo.append_text("Off")
             dithering_combo.append_text("On")
             dithering_combo.set_active(1)
-            grid.attach(dithering_label, 0, 2, 1, 1)
-            grid.attach(dithering_combo, 1, 2, 1, 1)
+            grid.attach(dithering_label, 0, 3, 1, 1)
+            grid.attach(dithering_combo, 1, 3, 1, 1)
 
             # Export palette combo box
             export_label = Gtk.Label(label="Export palette")
@@ -422,8 +479,8 @@ class Graph4Exporter (Gimp.PlugIn):
             export_combo.append_text("Off")
             export_combo.append_text("On")
             export_combo.set_active(1)
-            grid.attach(export_label, 0, 3, 1, 1)
-            grid.attach(export_combo, 1, 3, 1, 1)
+            grid.attach(export_label, 0, 4, 1, 1)
+            grid.attach(export_combo, 1, 4, 1, 1)
 
             # Reserve index 0 as transparency
             index0_label = Gtk.Label(label="Reserve index 0 as transparency")
@@ -432,8 +489,8 @@ class Graph4Exporter (Gimp.PlugIn):
             index0_combo.append_text("Off")
             index0_combo.append_text("On")
             index0_combo.set_active(1)
-            grid.attach(index0_label, 0, 4, 1, 1)
-            grid.attach(index0_combo, 1, 4, 1, 1)
+            grid.attach(index0_label, 0, 5, 1, 1)
+            grid.attach(index0_combo, 1, 5, 1, 1)
 
             # Color picker
             trans_label = Gtk.Label(label="Input transparent color")
@@ -442,14 +499,14 @@ class Graph4Exporter (Gimp.PlugIn):
             default_color = Gdk.RGBA()
             default_color.parse("#ff00ff")
             trans_button.set_rgba(default_color)
-            grid.attach(trans_label, 0, 5, 1, 1)
-            grid.attach(trans_button, 1, 5, 1, 1)
+            grid.attach(trans_label, 0, 6, 1, 1)
+            grid.attach(trans_button, 1, 6, 1, 1)
 
             # Radio button group
             radio_label = Gtk.Label(label="Image encoding")
             radio_label.set_halign(Gtk.Align.END)
-            radio1 = Gtk.RadioButton.new_with_label_from_widget(None, "Binary format with palette (SC5)")
-            radio2 = Gtk.RadioButton.new_with_label_from_widget(radio1, "Binary format without palette (SR5)")
+            radio1 = Gtk.RadioButton.new_with_label_from_widget(None, "Binary format with palette (SCn)")
+            radio2 = Gtk.RadioButton.new_with_label_from_widget(radio1, "Binary format without palette (SRn)")
             radio3 = Gtk.RadioButton.new_with_label_from_widget(radio1, "MSX-BASIC COPY to disk (no palette)")
             radio4 = Gtk.RadioButton.new_with_label_from_widget(radio1, "Raw file (no palette)")
             radio5 = Gtk.RadioButton.new_with_label_from_widget(radio1, "No output (image in new window)")
@@ -459,8 +516,14 @@ class Graph4Exporter (Gimp.PlugIn):
             radio_box.pack_start(radio3, False, False, 0)
             radio_box.pack_start(radio4, False, False, 0)
             radio_box.pack_start(radio5, False, False, 0)
-            grid.attach(radio_label, 0, 6, 1, 1)
-            grid.attach(radio_box, 1, 6, 1, 1)
+
+            # Interlaced mode: even lines in page 0, odd lines in page 1
+            interlaced_check = Gtk.CheckButton(label="Interlaced (double vertical resolution)")
+            enc_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
+            enc_box.pack_start(radio_box, False, False, 0)
+            enc_box.pack_start(interlaced_check, False, False, 0)
+            grid.attach(radio_label, 0, 7, 1, 1)
+            grid.attach(enc_box, 1, 7, 1, 1)
 
             # Reserve index 0 as transparency
             pal_label = Gtk.Label(label="Export plain text palette")
@@ -469,11 +532,13 @@ class Graph4Exporter (Gimp.PlugIn):
             pal_combo.append_text("Off")
             pal_combo.append_text("On")
             pal_combo.set_active(0)
-            grid.attach(pal_label, 0, 7, 1, 1)
-            grid.attach(pal_combo, 1, 7, 1, 1)
+            grid.attach(pal_label, 0, 8, 1, 1)
+            grid.attach(pal_combo, 1, 8, 1, 1)
 
             # Connect the index0 "changed" signal to trans_button
             index0_combo.connect("changed", on_combo_changed, trans_button)
+            # the interlaced option is useless when there is no output
+            radio5.connect("toggled", on_radio_toggled, interlaced_check)
 
             dialog.show_all()
             response = dialog.run()
@@ -482,18 +547,21 @@ class Graph4Exporter (Gimp.PlugIn):
                 [item.set_sensitive(False) for item in grid.get_children()]
                 file_value = file_entry.get_text()
                 folder_value = folder_button.get_filename()
+                screen_value = [SCREEN5, SCREEN7][screen_combo.get_active()]
                 dithering_value = dithering_combo.get_active()
                 export_value = export_combo.get_active()
                 index0_value = index0_combo.get_active()
                 trans_color = denormalize(trans_button.get_rgba())
                 encoding_value = ENC_GROUP[[item.get_active() for item in radio_box.get_children()].index(1)]
+                interlaced_value = interlaced_check.get_active()
                 pal_value = pal_combo.get_active()
                 dialog.destroy()
 
                 # progress dialog will bock
                 result = self.convert(PluginConnector(self),
                     file_value, folder_value, dithering_value, export_value,
-                    index0_value, trans_color, encoding_value, pal_value)
+                    index0_value, trans_color, encoding_value, pal_value,
+                    screen_value, interlaced_value)
                 return procedure.new_return_values(*result)
             else:
                 dialog.destroy()

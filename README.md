@@ -9,19 +9,37 @@ GIMP script to export bitmap as GRAPHICS 4 file (a.k.a. "SCREEN 5"). GRAPHICS 4 
 * 16 color palette (from 512);
 * sprite mode 2;
 
+The plug-in also exports **SCREEN 7** images (GRAPHIC 6, 512x212, 16 colors) and supports **interlaced** images (double vertical resolution, 424 lines).
+
 Plug-in is accessible through _Filters > MSX >> MSX2 Graphics 4 Image Converter_.  You may disable **Image Encoding** altogether to create an image inside GIMP and not export it to disk at all. In this case, the plug-in doesn't check image size. But be warned: big images tend to take a very. Long. Time.
 
 ### Meaning of input fields
 
 * Input transparent color: if the source image doesn't have any transparency, consider this colour the transparent colour when converting image to the MSX (set index to 0). This requires "Reserve index 0 as transparency" to be active.
 * Reserve index 0 as transparency: the plugin can optionally use the colour index 0 as a normal colour and get one more usable colour. It may improve dithering a little bit if disabled.
+* Screen mode: SCREEN5 (256x212, 16 colors, 32K page) or SCREEN7 (512x212, 16 colors, 64K page). The screen mode defines the image width, the page size and the palette address.
+* Interlaced: the image is split in two pages (even lines in page 0, odd lines in page 1), doubling the vertical resolution (up to 424 lines). See [Interlaced files](#interlaced-files).
 * Image encoding: common MSX image formats the plugin recognises.
+
+### Output files
+
+| Image encoding | SCREEN5 | SCREEN7 | Content |
+| --- | --- | --- | --- |
+| Binary format with palette (SCn) | `NONAME.SC5` | `NONAME.SC7` | MSX binary (BSAVE compatible) with the bitmap and the palette |
+| Binary format without palette (SRn) | `NONAME.SR5` | `NONAME.SR7` | MSX binary (BSAVE compatible) with the bitmap only |
+| MSX-BASIC COPY to disk (no palette) | `NONAME.DAT` | `NONAME.DAT` | screen dump for the MSX-BASIC `COPY` command |
+| Raw file (no palette) | `NONAME.RAW` | `NONAME.RAW` | raw bitmap data, no header |
+| No output (image in new window) | - | - | the quantized image is displayed in a new GIMP window |
+
+Two extra files may be written: `NONAME.PAL` (the palette in MSX binary format, when **Export palette** is active) and `NONAME.TXT` (the palette as plain text, when **Export plain text palette** is active).
 
 ### Latest changes
 
 * GIMP2 plug-in version got a speed boost;
 * The plugin now detects if a predefined transparent colour is being used (alpha=0) and force it to index 0. "Reserve index 0 as transparency" must be activated.
 * New GIMP3 plugin version added.
+* SCREEN 7 (512x212) support, with its own file formats (SC7/SR7);
+* Interlaced images (double vertical resolution) support.
 
 ## Original vs sample image
 
@@ -82,6 +100,41 @@ DAT (DATA) files are copies of portions of the screen dumped to a disk file. The
 ```
 A palette file (NONAME.PAL) is still recommended to restore the image properly.
 
+## Loading SC7 files
+
+SCREEN 7 files are loaded much like SCREEN 5 ones, but the screen mode and the image width are different:
+
+```
+10 SCREEN 7
+20 REM use line below if transparency is disabled
+30 VDP(9)=VDP(9) OR &H20
+40 BLOAD"NONAME.SC7",S
+50 COLOR=RESTORE
+60 IF INKEY$ = "" GOTO 60
+```
+
+The palette of a SCREEN 7 file lives at `&HFA80` (instead of `&H7680` for SCREEN 5), so `COLOR=RESTORE` restores it properly.
+
+## Interlaced files
+
+The MSX2 VDP can display up to 424 lines by alternating the even and the odd lines of the image at 60Hz (interlaced mode). The plug-in writes the even lines of the image in page 0 and the odd lines in page 1, so the source image must have twice the vertical resolution of the target screen (e.g. 256x424 for a 256x212 SCREEN 5 screen).
+
+* The **SCn** and **SRn** formats keep the two pages apart (32K each for SCREEN 5, 64K each for SCREEN 7), so that the file can be loaded in a single go;
+* The **RAW** format and the **DAT** format pack both pages together (the second page immediately after the first one).
+
+Interlaced SCREEN 5 files are loaded like this:
+
+```
+10 SCREEN 5
+20 BLOAD"NONAME.SC5",S
+30 REM interlaced mode (IL) and even/odd alternate display (EO)
+40 VDP(10)=VDP(10) OR &H0C
+50 COLOR=RESTORE
+60 IF INKEY$ = "" GOTO 60
+```
+
+Interlaced SCREEN 7 files are 128K long (two 64K pages) and don't fit in the 16-bit address range of the `BLOAD` command: they must be loaded in two parts (or with a custom routine) on a MSX2 with 128K of VRAM.
+
 ## TODO
 
 * [ ] divide big files into 8 or 16K chunks for ROM/mapper if requested;
@@ -97,6 +150,8 @@ A palette file (NONAME.PAL) is still recommended to restore the image properly.
 * [x] embedded palette support;
 * [x] MSX-BASIC COPY to disk format support;
 * [x] enable user to define the transparent colour;
+* [x] SCREEN 7 mode;
+* [x] interlaced mode (double vertical resolution);
 * [ ] RLE encoding;
 * [ ] aPLib compression;
 * [ ] converting layers into pages;

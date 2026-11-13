@@ -28,14 +28,19 @@ BIN_PREFIX = 0xFE
 DEFAULT_FILENAME = 'NONAME'
 DEFAULT_VRES = 'v212'
 DEFAULT_OUTPUT_DIR = os.getcwd()
-DEFAULT_OUTPUT_FMT = 'SC5'
+DEFAULT_OUTPUT_FMT = 'SC'
 MAX_COLORS = 16
-MAX_WIDTH = 256
-MAX_HEIGHT = 256
 MAX_DAT_HEIGHT = 212
-MAX_PAGES = 4
-PALETTE_OFFSET = 0x7680
 FIXED_DITHERING = 3
+
+# screen modes
+SCREEN5 = "SCREEN5"
+SCREEN7 = "SCREEN7"
+# width, bytes per line, page size in bytes, palette offset, file name suffix
+SCREEN_MODES = {
+    SCREEN5: {"width": 256, "line_size": 128, "page_size": 0x8000, "palette_offset": 0x7680, "suffix": "5"},
+    SCREEN7: {"width": 512, "line_size": 256, "page_size": 0x10000, "palette_offset": 0xFA80, "suffix": "7"},
+}
 
 
 # base image type
@@ -110,40 +115,44 @@ class PluginConnector:
             gimpfu.pdb.gimp_progress_init(text, None)
 
 
-def check_params(image, filename, folder, encoding, exp_pal, paltxt_file):
+def check_params(image, filename, folder, encoding, exp_pal, paltxt_file, screen_mode, interlaced):
     drawable = gimpfu.pdb.gimp_image_active_drawable(image)
     width, height = gimpfu.pdb.gimp_drawable_width(drawable), gimpfu.pdb.gimp_drawable_height(drawable)
+    mode = SCREEN_MODES[screen_mode]
     errors = []
     if encoding != 'no-output':
-        if os.path.exists(os.path.join(folder, '%s.%s' % (filename, encoding))):
-            errors.append('Output file "%s.%s" already exists.' % (filename, encoding))
-
+        # interlaced images are split in two pages: even lines in page 0, odd lines in page 1
+        pages = 2 if interlaced else 1
+        max_height = (mode["page_size"] // mode["line_size"]) * pages
+        # number of lines stored in each page
+        page_lines = (height + 1) // 2 if interlaced else height
         if encoding == 'DAT':
-            if width > MAX_WIDTH:
-                errors.append('Drawable width must be less than or equal to %i.' % MAX_WIDTH)
-            if height > MAX_DAT_HEIGHT:
+            if width > mode["width"]:
+                errors.append('Drawable width must be less than or equal to %i.' % mode["width"])
+            if page_lines > MAX_DAT_HEIGHT:
                 errors.append('Drawable height must be less than or equal to %i.' % MAX_DAT_HEIGHT)
-
-        elif width != MAX_WIDTH:
-            errors.append('Drawable width must be %i.' % MAX_WIDTH)
-
-    if exp_pal and os.path.exists(os.path.join(folder, '%s.PAL' % filename)):
-        errors.append('Output palette "%s.PAL" file already exists.' % filename)
-
-    if paltxt_file and os.path.exists(os.path.join(folder, '%s.TXT' % filename)):
-        errors.append('Output plain text palette "%s.TXT" file already exists.' % filename)
-
-    if height > MAX_HEIGHT * MAX_PAGES:
-        errors.append('Drawable height must not be bigger than %i.' % (MAX_HEIGHT * MAX_PAGES))
+        elif width != mode["width"]:
+            errors.append('Drawable width must be %i.' % mode["width"])
+        if height > max_height:
+            errors.append('Drawable height must not be bigger than %i.' % max_height)
+        if interlaced and height % 2:
+            errors.append('Drawable height must be even for interlaced images.')
 
     if encoding in ('RLE', 'aPLib'):
         errors.append('compression is not implemented yet.')
 
-    return []
+    return errors
 
 
-def do_write_g4(image, layer, filename, folder, dithering, exp_pal, skip_index0, trans_color, encoding, paltxt_file):
-    errors = check_params(image, filename, folder, encoding, exp_pal, paltxt_file)
+def do_write_g4(image, layer, filename, folder, dithering, exp_pal, skip_index0, trans_color, encoding, paltxt_file, screen_mode, interlaced):
+    mode = SCREEN_MODES[screen_mode]
+    line_size = mode["line_size"]
+    page_size = mode["page_size"]
+    palette_offset = mode["palette_offset"]
+    # file name suffix: SC5/SC7, SR5/SR7, DAT, RAW
+    extension = encoding if encoding in ("DAT", "RAW", "no-output") else encoding + mode["suffix"]
+
+    errors = check_params(image, filename, folder, encoding, exp_pal, paltxt_file, screen_mode, interlaced)
     if errors:
         gimp.message("\n".join(errors))
         return
@@ -190,15 +199,15 @@ def do_write_g4(image, layer, filename, folder, dithering, exp_pal, skip_index0,
         query = create_distance_query(palette)
 
     for (r, g, b), index in palette:
-        # Start palette at color 1 if transparency is set.
-        i = index + (1 if skip_index0 else 0)
+        # Start palette at color 1 if transparency is used.
+        i = index + (1 if use_transparency else 0)
         pal9bits[i * 2] = 16 * (r >> 5) + (b >> 5)
         pal9bits[i * 2 + 1] = (g >> 5)
         txtpal[i] = (r >> 5, g >> 5, b >> 5)
 
     if paltxt_file:
         file = open(os.path.join(folder, '%s.TXT' % filename), 'wt')
-        print('SCREEN 5 palette:', file=file)
+        print('%s palette:' % screen_mode, file=file)
         i = 0
         for (r, g, b) in txtpal:
             print('%i: %i, %i, %i' % (i, r, g, b), file=file)
@@ -206,19 +215,30 @@ def do_write_g4(image, layer, filename, folder, dithering, exp_pal, skip_index0,
         file.close()
 
     if exp_pal:
-        encoded = struct.pack('<BHHH{}B'.format(len(pal9bits)), BIN_PREFIX, PALETTE_OFFSET,
-                PALETTE_OFFSET + len(pal9bits), 0, *pal9bits[0:len(pal9bits)])
+        encoded = struct.pack('<BHHH{}B'.format(len(pal9bits)), BIN_PREFIX, palette_offset,
+                palette_offset + len(pal9bits) - 1, 0, *pal9bits[0:len(pal9bits)])
         file = open(os.path.join(folder, '%s.PAL' % filename), 'wb')
         file.write(encoded)
         file.close()
 
-    connector.set_progress(text="Exporting image to {} format".format(encoding))
+    connector.set_progress(text="Exporting image to {} format".format(extension))
 
-    # buffer = [0] * (MAX_WIDTH // 2) * MAX_HEIGHT
-    if encoding == 'DAT':
-        buffer = [0] * (connector.width // 2) * connector.height
+    # line size may vary for the MSX-BASIC COPY format
+    stride = connector.width // 2 if encoding == 'DAT' else line_size
+    # number of lines stored in each page
+    page_lines = (connector.height + 1) // 2 if interlaced else connector.height
+
+    if encoding in ('RAW', 'DAT'):
+        # raw files pack both pages together
+        buffer = [0] * (stride * page_lines * (2 if interlaced else 1))
+    elif interlaced:
+        # interlaced binary files keep the two pages apart
+        buffer = [0] * max(page_size * 2, palette_offset + 2 * MAX_COLORS)
+    elif encoding == 'SC':
+        # make sure to save space for inner palette
+        buffer = [0] * max(palette_offset + 2 * MAX_COLORS, stride * page_lines)
     else:
-        buffer = [0] * (MAX_WIDTH // 2) * MAX_HEIGHT
+        buffer = [0] * (stride * page_lines)
 
     if encoding != 'no-output':
         for y in range(0, connector.height):
@@ -229,22 +249,34 @@ def do_write_g4(image, layer, filename, folder, dithering, exp_pal, skip_index0,
                     index = 0
                 else:
                     index, _ = query((r, g, b))
-                    index += 1 if skip_index0 else 0
-                pos = x // 2 + y * (connector.width // 2)
+                    # index 0 is reserved for transparency only if it is used
+                    index += 1 if use_transparency else 0
+                if interlaced:
+                    # even lines go to page 0, odd lines go to page 1
+                    if encoding in ('RAW', 'DAT'):
+                        # raw files pack both pages together
+                        pos = (y // 2) * stride if y % 2 == 0 else (page_lines + y // 2) * stride
+                    else:
+                        pos = (y % 2) * page_size + (y // 2) * stride
+                else:
+                    pos = y * stride
+                pos += x // 2
                 buffer[pos] |= index if x % 2 else index << 4;
             connector.set_progress(float(y) / connector.height)
 
-        # Embed palette into image data (SC5 only)
-        if encoding == 'SC5':
-            for pos in range(32):
-                buffer[0x7680 + pos] = pal9bits[pos]
+        # Embed palette into image data (SC only)
+        if encoding == 'SC':
+            for pos in range(2 * MAX_COLORS):
+                buffer[palette_offset + pos] = pal9bits[pos]
         if encoding == 'RAW':
             encoded = struct.pack('<{}B'.format(len(buffer)), *buffer)
         elif encoding == 'DAT':
-            encoded = struct.pack('<HH{}B'.format(connector.width * connector.height // 2), connector.width, connector.height, *buffer)
+            encoded = struct.pack('<HH{}B'.format(len(buffer)), connector.width, connector.height, *buffer)
         else:
-            encoded = struct.pack('<BHHH{}B'.format(len(buffer)), BIN_PREFIX, 0, len(buffer), 0, *buffer)
-        file = open(os.path.join(folder, '%s.%s' % (filename, encoding)), 'wb')
+            # the end address of a BSAVE file is limited to 16 bits
+            end = min(len(buffer) - 1, 0xFFFF)
+            encoded = struct.pack('<BHHH{}B'.format(len(buffer)), BIN_PREFIX, 0, end, 0, *buffer)
+        file = open(os.path.join(folder, '%s.%s' % (filename, extension)), 'wb')
         file.write(encoded)
         file.close()
         gimp.delete(new_image)
@@ -363,7 +395,7 @@ def downsampling(connector, trans_color, dithering):
         connector.set_progress(float(y) / connector.height)
 
 
-def write_g4(image, layer, filename, folder, dithering, exp_pal, skip_index0, trans_color, encoding, paltxt_file):
+def write_g4(image, layer, filename, folder, dithering, exp_pal, skip_index0, trans_color, encoding, paltxt_file, screen_mode, interlaced):
     '''
     Export image to GRAPHICS 4, a.k.a. SCREEN 5 (MSX2).
     
@@ -377,14 +409,16 @@ def write_g4(image, layer, filename, folder, dithering, exp_pal, skip_index0, tr
     @param trans_color: RGB components of input color to be considered transparency
     @param encoding: output encoding
     @param paltxt_file: export plain-text-palette data too
+    @param screen_mode: SCREEN5 or SCREEN7
+    @param interlaced: double vertical resolution (two pages)
     '''
     try:
-        do_write_g4(image, layer, filename, folder, dithering, exp_pal, skip_index0, trans_color, encoding, paltxt_file)
+        do_write_g4(image, layer, filename, folder, dithering, exp_pal, skip_index0, trans_color, encoding, paltxt_file, screen_mode, interlaced)
     except Exception:
         gimp.message(traceback.format_exc())
 
 
-def write_g4_alpha(image, layer, filename, folder, dithering, exp_pal, encoding, paltxt_file):
+def write_g4_alpha(image, layer, filename, folder, dithering, exp_pal, encoding, paltxt_file, screen_mode, interlaced):
     '''
     Export image with alpha to GRAPHICS 4, a.k.a. SCREEN 5 (MSX2).
     
@@ -396,9 +430,11 @@ def write_g4_alpha(image, layer, filename, folder, dithering, exp_pal, encoding,
     @param exp_pal: export palette data too
     @param encoding: output encoding
     @param paltxt_file: export plain-text-palette data too
+    @param screen_mode: SCREEN5 or SCREEN7
+    @param interlaced: double vertical resolution (two pages)
     '''
     try:
-        do_write_g4(image, layer, filename, folder, dithering, exp_pal, True, None, encoding, paltxt_file)
+        do_write_g4(image, layer, filename, folder, dithering, exp_pal, True, None, encoding, paltxt_file, screen_mode, interlaced)
     except Exception:
         gimp.message(traceback.format_exc())
 
@@ -415,9 +451,13 @@ gimpfu.register("msx_g4_exporter",
                     (gimpfu.PF_BOOL, "exp-pal", "Export palette", False),
                     (gimpfu.PF_BOOL, "skip_index0", "Reserve index 0 for transparency", True),
                     (gimpfu.PF_COLOR, "trans_color", "Input transparent color", (0xff, 0x0, 0xff)),
+                    (gimpfu.PF_RADIO, "screen-mode", "Screen mode", SCREEN5,
+                       (("SCREEN5", SCREEN5),
+                        ("SCREEN7", SCREEN7))),
+                    (gimpfu.PF_BOOL, "interlaced", "Interlaced (double vertical resolution)", False),
                     (gimpfu.PF_RADIO, "image-enc", "Image Encoding", DEFAULT_OUTPUT_FMT,
-                       (("Binary format with palette (SC5)", "SC5"),
-                        ("Binary format without palette (SR5)", "SR5"),
+                       (("Binary format with palette (SCn)", "SC"),
+                        ("Binary format without palette (SRn)", "SR"),
                         ("MSX-BASIC COPY to disk (no palette)", "DAT"),
                         ("Raw file (no palette)", "RAW"),
                         ("No output (image in new window)", "no-output"))),
@@ -436,9 +476,13 @@ gimpfu.register("msx_g4_exporter_alpha",
                     (gimpfu.PF_DIRNAME, "folder", "Output Folder", DEFAULT_OUTPUT_DIR),
                     (gimpfu.PF_BOOL, "dithering", "Dithering", True),
                     (gimpfu.PF_BOOL, "exp-pal", "Export palette", False),
+                    (gimpfu.PF_RADIO, "screen-mode", "Screen mode", SCREEN5,
+                       (("SCREEN5", SCREEN5),
+                        ("SCREEN7", SCREEN7))),
+                    (gimpfu.PF_BOOL, "interlaced", "Interlaced (double vertical resolution)", False),
                     (gimpfu.PF_RADIO, "image-enc", "Image Encoding", DEFAULT_OUTPUT_FMT,
-                       (("Binary format with palette (SC5)", "SC5"),
-                        ("Binary format without palette (SR5)", "SR5"),
+                       (("Binary format with palette (SCn)", "SC"),
+                        ("Binary format without palette (SRn)", "SR"),
                         ("MSX-BASIC COPY to disk (no palette)", "DAT"),
                         ("Raw file (no palette)", "RAW"),
                         ("No output (image in new window)", "no-output"))),
