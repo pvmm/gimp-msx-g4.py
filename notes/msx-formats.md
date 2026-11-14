@@ -60,9 +60,11 @@ writes the even lines in page 0 and the odd lines in page 1.
 
 openMSX dumps an interlaced screen as two files (`.SC5` and `.S15` — the mode
 number is appended to the extension, one file per page). This plug-in keeps
-both pages in a single file for SCREEN 5 and for RAW/DAT formats; interlaced
+both pages in a single file for SCREEN 5 and for `DAT` formats; interlaced
 SCREEN 7 SC/SR is split into two files (`.S70`/`.S71`, `.R70`/`.R71`) because
-two 64K pages do not fit in one BSAVE file.
+two 64K pages do not fit in one BSAVE file, and interlaced SCREEN 7 RAW is
+split into `w70`/`w71` (one raw page per file). Interlaced SCREEN 5 RAW packs
+both pages together in a single `.RAW` file.
 
 ## File formats
 
@@ -118,8 +120,11 @@ size (212 lines per field).
 
 ### `.RAW` — raw bitmap
 
-No header, just the bitmap. With interlacing, the even lines come first and
-the odd lines follow immediately (no page padding).
+No header, just the bitmap. With interlacing on SCREEN 5 (and for `DAT`), the
+even lines come first and the odd lines follow immediately (no page padding).
+With interlacing on SCREEN 7, the export is split into two files: `NONAME.w70`
+(page 0, even lines) and `NONAME.w71` (page 1, odd lines), each containing one
+raw page (64K for SCREEN 7).
 
 ### `.PAL` — palette file
 

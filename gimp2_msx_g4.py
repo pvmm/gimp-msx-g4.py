@@ -333,10 +333,21 @@ def do_write_g4(image, layer, filename, folder, dithering, exp_pal, skip_index0,
 
         # Interlaced SCREEN 7 does not fit in the 16-bit range of a single BSAVE
         # file (2 x 64K pages), so it is split into two files: page 0 (.S70/.R70)
-        # and page 1 (.S71/.R71).
+        # and page 1 (.S71/.R71). Raw interlaced SCREEN 7 is split into page 0
+        # (.w70) and page 1 (.w71), one raw page per file.
         split_sc7 = interlaced and screen_mode == "SCREEN7" and encoding in ('SC', 'SR')
+        split_raw_sc7 = interlaced and screen_mode == "SCREEN7" and encoding == 'RAW'
 
-        if encoding == 'RAW':
+        if split_raw_sc7:
+            page_bytes = page_lines * stride
+            page0 = buffer[0:page_bytes]
+            page1 = buffer[page_bytes:page_bytes * 2]
+            for ext, page in (('w70', page0), ('w71', page1)):
+                encoded = struct.pack('<{}B'.format(len(page)), *page)
+                f = open(os.path.join(folder, '%s.%s' % (filename, ext)), 'wb')
+                f.write(encoded)
+                f.close()
+        elif encoding == 'RAW':
             encoded = struct.pack('<{}B'.format(len(buffer)), *buffer)
             file = open(os.path.join(folder, '%s.%s' % (filename, extension)), 'wb')
             file.write(encoded)
@@ -574,7 +585,7 @@ gimpfu.register("msx_g4_exporter",
                        (("Binary format with palette (SCn)", "SC"),
                         ("Binary format without palette (SRn)", "SR"),
                         ("MSX-BASIC COPY to disk (no palette)", "DAT"),
-                        ("Raw file (no palette)", "RAW"),
+                        ("Raw file without formatting (no palette)", "RAW"),
                         ("No output (image in new window)", "no-output"))),
                     (gimpfu.PF_BOOL, "paltxt_file", "Export plain text palette", bool(_SETTINGS["pal_file"]))
                 ],
@@ -601,7 +612,7 @@ gimpfu.register("msx_g4_exporter_alpha",
                        (("Binary format with palette (SCn)", "SC"),
                         ("Binary format without palette (SRn)", "SR"),
                         ("MSX-BASIC COPY to disk (no palette)", "DAT"),
-                        ("Raw file (no palette)", "RAW"),
+                        ("Raw file without formatting (no palette)", "RAW"),
                         ("No output (image in new window)", "no-output"))),
                     (gimpfu.PF_BOOL, "paltxt-file", "Export plain text palette", bool(_SETTINGS["pal_file"]))
                 ],

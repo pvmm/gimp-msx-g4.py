@@ -28,10 +28,10 @@ Plug-in is accessible through _Filters > MSX >> MSX2 Graphics 4 Image Converter_
 | Binary format with palette (SCn) | `NONAME.SC5` | `NONAME.SC7` | MSX binary (BSAVE compatible) with the bitmap and the palette |
 | Binary format without palette (SRn) | `NONAME.SR5` | `NONAME.SR7` | MSX binary (BSAVE compatible) with the bitmap only |
 | MSX-BASIC COPY to disk (no palette) | `NONAME.DAT` | `NONAME.DAT` | screen dump for the MSX-BASIC `COPY` command |
-| Raw file (no palette) | `NONAME.RAW` | `NONAME.RAW` | raw bitmap data, no header |
+| Raw file without formatting (no palette) | `NONAME.RAW` | `NONAME.RAW` | raw bitmap data, no header |
 | No output (image in new window) | - | - | the quantized image is displayed in a new GIMP window |
 
-**Interlaced SCREEN 7 (SCn/SRn)** is split into two files because two 64K pages do not fit in a single BSAVE file: page 0 (even lines) is written as `NONAME.S70` / `NONAME.R70` and page 1 (odd lines) as `NONAME.S71` / `NONAME.R71`. Interlaced SCREEN 5 and interlaced RAW/DAT remain single files.
+**Interlaced SCREEN 7 (SCn/SRn)** is split into two files because two 64K pages do not fit in a single BSAVE file: page 0 (even lines) is written as `NONAME.S70` / `NONAME.R70` and page 1 (odd lines) as `NONAME.S71` / `NONAME.R71`. **Interlaced SCREEN 7 raw** (`Raw file without formatting`) is split into `NONAME.w70` (page 0, even lines) and `NONAME.w71` (page 1, odd lines), one raw page per file. Interlaced SCREEN 5 and interlaced SCREEN 5/SCREEN 7 `DAT` remain single files (both pages packed together).
 
 Two extra files may be written: `NONAME.PAL` (the palette in MSX binary format, when **Export palette** is active) and `NONAME.TXT` (the palette as plain text, when **Export plain text palette** is active).
 
@@ -123,7 +123,8 @@ The MSX2 VDP can display up to 424 lines by alternating the even and the odd lin
 
 * **SCREEN 5 (SC5/SR5)** keeps the two pages in a single file (32K each, 64K total) so it can be loaded in one `BLOAD`.
 * **SCREEN 7 (SCn/SRn)** is split into two files because two 64K pages do not fit in one BSAVE: `NONAME.S70`/`NONAME.R70` (page 0, even lines) and `NONAME.S71`/`NONAME.R71` (page 1, odd lines).
-* The **RAW** and **DAT** formats pack both pages together (the second page immediately after the first one).
+* **RAW (interlaced SCREEN 7)** is split into `NONAME.d70` (page 0, even lines) and `NONAME.d71` (page 1, odd lines), one raw page per file (no header).
+* **RAW (interlaced SCREEN 5)** and **DAT** pack both pages together (the second page immediately after the first one).
 
 ### Loading interlaced SCREEN 5
 

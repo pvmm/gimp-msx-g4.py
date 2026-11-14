@@ -419,10 +419,20 @@ def do_convert(connector, filename, folder, dithering, export_pal, skip_index0, 
 
         # Interlaced SCREEN 7 does not fit in the 16-bit range of a single BSAVE
         # file (2 x 64K pages), so it is split into two files: page 0 (.S70/.R70)
-        # and page 1 (.S71/.R71).
+        # and page 1 (.S71/.R71). Raw interlaced SCREEN 7 is split into page 0
+        # (.w70) and page 1 (.w71), one raw page per file.
         split_sc7 = interlaced and screen_mode == "SCREEN7" and encoding in ('SC', 'SR')
+        split_raw_sc7 = interlaced and screen_mode == "SCREEN7" and encoding == 'RAW'
 
-        if encoding == 'RAW':
+        if split_raw_sc7:
+            page_bytes = page_lines * stride
+            page0 = buffer[0:page_bytes]
+            page1 = buffer[page_bytes:page_bytes * 2]
+            for ext, page in (('w70', page0), ('w71', page1)):
+                encoded = struct.pack('<{}B'.format(len(page)), *page)
+                with open(os.path.join(folder, '%s.%s' % (filename, ext)), 'wb') as file:
+                    file.write(encoded)
+        elif encoding == 'RAW':
             encoded = struct.pack('<{}B'.format(len(buffer)), *buffer)
             with open(os.path.join(folder, '%s.%s' % (filename, extension)), 'wb') as file:
                 file.write(encoded)
@@ -603,7 +613,7 @@ class Graph4Exporter (Gimp.PlugIn):
             radio1 = Gtk.RadioButton.new_with_label_from_widget(None, "Binary format with palette (SCn)")
             radio2 = Gtk.RadioButton.new_with_label_from_widget(radio1, "Binary format without palette (SRn)")
             radio3 = Gtk.RadioButton.new_with_label_from_widget(radio1, "MSX-BASIC COPY to disk (no palette)")
-            radio4 = Gtk.RadioButton.new_with_label_from_widget(radio1, "Raw file (no palette)")
+            radio4 = Gtk.RadioButton.new_with_label_from_widget(radio1, "Raw file without formatting (no palette)")
             radio5 = Gtk.RadioButton.new_with_label_from_widget(radio1, "No output (image in new window)")
             radio_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
             radio_box.pack_start(radio1, False, False, 0)
