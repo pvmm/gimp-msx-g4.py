@@ -43,7 +43,7 @@ import traceback
 NOTRANS = (None, None, None, None)  # ignored, use a colour that will never match
 MAX_COLORS = 16
 MAX_DAT_HEIGHT = 212
-ENC_GROUP = {0: "SC", 1: "SR", 2: "DAT", 3: "RAW", 4: "no-output" }
+ENC_GROUP = {0: "sc", 1: "sr", 2: "dat", 3: "raw", 4: "no-output" }
 BIN_PREFIX = 0xFE
 DEFAULT_FILENAME = 'NONAME'
 
@@ -64,8 +64,9 @@ def load_settings():
         "export_pal": 1,
         "skip_index0": 1,
         "trans_color": [255, 0, 255, 255],
-        "encoding": "SC",
+        "encoding": "sc",
         "pal_file": 0,
+        "preserve_colors": "",
     }
     try:
         with open(_settings_path(), "r") as f:
@@ -78,7 +79,7 @@ def load_settings():
     if defaults.get("screen_mode") not in (SCREEN5, SCREEN7):
         defaults["screen_mode"] = SCREEN5
     if defaults.get("encoding") not in ENC_GROUP:
-        defaults["encoding"] = "SC"
+        defaults["encoding"] = "sc"
     tc = defaults.get("trans_color")
     if not (isinstance(tc, (list, tuple)) and len(tc) >= 3):
         defaults["trans_color"] = [255, 0, 255, 255]
@@ -92,6 +93,9 @@ def load_settings():
     name = defaults.get("filename")
     if not isinstance(name, str) or not name:
         defaults["filename"] = DEFAULT_FILENAME
+    pc = defaults.get("preserve_colors")
+    if not isinstance(pc, str):
+        defaults["preserve_colors"] = ""
     return defaults
 
 
@@ -152,6 +156,58 @@ def compress_rgb(r, g, b, a=255):
     g = int(round(float(g) / 0xff * 7)) << 5
     b = int(round(float(b) / 0xff * 7)) << 5
     return (r, g, b, 255)
+
+
+def parse_preserve_colors(spec):
+    """Parse 'n=#RRGGBB, !n=#RRGGBB' into (fixed, forbidden).
+
+    fixed: {index: (r, g, b)}  - index and color value preserved.
+    forbidden: {index}          - index off-limits for conversion (color value
+                                  may still be used by other indices).
+    """
+    fixed = {}
+    forbidden = set()
+    spec = spec.strip()
+    if not spec:
+        return fixed, forbidden
+    for token in spec.split(','):
+        token = token.strip()
+        if not token:
+            continue
+        is_forbidden = token.startswith('!')
+        if is_forbidden:
+            token = token[1:].strip()
+        if '=' not in token:
+            raise ImageFormatError(_('Invalid preserve entry "{}": expected n=#RRGGBB.').format(token))
+        left, right = token.split('=', 1)
+        left = left.strip()
+        right = right.strip()
+        try:
+            idx = int(left, 10)
+        except ValueError:
+            raise ImageFormatError(_('Invalid preserve index "{}": expected 0-15.').format(left))
+        if idx < 0 or idx > MAX_COLORS - 1:
+            raise ImageFormatError(_('Preserve index {} out of range (0-15).').format(idx))
+        color = right.lstrip('#')
+        if len(color) != 6:
+            raise ImageFormatError(_('Invalid preserve color "{}": expected #RRGGBB.').format(right))
+        try:
+            r = int(color[0:2], 16)
+            g = int(color[2:4], 16)
+            b = int(color[4:6], 16)
+        except ValueError:
+            raise ImageFormatError(_('Invalid preserve color "{}": expected #RRGGBB.').format(right))
+        if is_forbidden:
+            if idx in fixed:
+                raise ImageFormatError(_('Preserve index {} cannot be both fixed and forbidden.').format(idx))
+            forbidden.add(idx)
+        else:
+            if idx in forbidden:
+                raise ImageFormatError(_('Preserve index {} cannot be both fixed and forbidden.').format(idx))
+            if idx in fixed and fixed[idx] != (r, g, b):
+                raise ImageFormatError(_('Preserve index {} specified twice with different colors.').format(idx))
+            fixed[idx] = (r, g, b)
+    return fixed, forbidden
 
 
 def scatter_noise(connector, x, y, error):
@@ -230,20 +286,28 @@ def quantize_colors(connector, histogram, length):
     return palette
 
 
-def create_distance_query(palette):
-    """Create function that returns the nearest colour by value."""
-    palmap = {k:v for k, v in palette}
+def create_distance_query(items):
+    """Create function that returns the nearest colour by value.
+
+    items: [(slot, (r, g, b)), ...]  slot is the MSX palette index.
+    Returns (slot, (r, g, b)).
+    """
+    palmap = {tuple(color): slot for slot, color in items}
+    slots = [(slot, tuple(color)) for slot, color in items]
+
     def query_index(pixel):
-        idx = palmap.get(pixel)
-        # Exact match returns (index, colour tuple)
-        if idx: return palette[idx][1], palette[idx][0]
-        distances = [(idx, distance(pixel, color), color) for color, idx in palette]
-        nearest = min(distances, key=lambda triple: triple[1])
-        #pprint(('pixel =', pixel, ' distances =', distances, ' min =', nearest))
-        # Store value for fast lookup next time
-        palmap[pixel] = nearest[0]
-        # index and colour tuple
-        return nearest[0], nearest[2]
+        c = tuple(pixel[0:3])
+        slot = palmap.get(c)
+        if slot is not None:
+            return slot, c
+        nearest_slot, nearest_color, nearest_dist = None, None, None
+        for slot_i, color_i in slots:
+            d = distance(c, color_i)
+            if nearest_dist is None or d < nearest_dist:
+                nearest_slot, nearest_color, nearest_dist = slot_i, color_i, d
+        palmap[c] = nearest_slot
+        return nearest_slot, nearest_color
+
     return query_index
 
 
@@ -280,15 +344,15 @@ def convert(connector, *args):
         message = ''.join(traceback.format_exception(type(e), e, e.__traceback__))
         connector.throw(message)
 
-def do_convert(connector, filename, folder, dithering, export_pal, skip_index0, trans_color, encoding, pal_file, screen_mode, interlaced):
+def do_convert(connector, filename, folder, dithering, export_pal, skip_index0, trans_color, encoding, pal_file, screen_mode, interlaced, preserve_colors=""):
     global _
     mode = SCREEN_MODES[screen_mode]
     width = mode["width"]
     line_size = mode["line_size"]
     page_size = mode["page_size"]
     palette_offset = mode["palette_offset"]
-    # file name suffix: SC5/SC7, SR5/SR7, DAT, RAW
-    extension = encoding if encoding in ("DAT", "RAW", "no-output") else encoding + mode["suffix"]
+    # file name suffix: sc5/sc7, sr5/sr7, dat, raw
+    extension = encoding if encoding in ("dat", "raw", "no-output") else encoding + mode["suffix"]
 
     # transparent color ignored if not required
     if not skip_index0:
@@ -302,7 +366,7 @@ def do_convert(connector, filename, folder, dithering, export_pal, skip_index0, 
     max_height = (page_size // line_size) * pages
 
     if encoding != "no-output":
-        if encoding != "DAT" and connector.width != width:
+        if encoding != "dat" and connector.width != width:
             raise ImageFormatError(_("Width should be exactly {} (currently {}) for this image type.").format(width, connector.width))
         elif connector.width > width:
             raise ImageFormatError(_("Width should not be greater than {} (currently {}) for this image type.").format(width, connector.width))
@@ -310,37 +374,56 @@ def do_convert(connector, filename, folder, dithering, export_pal, skip_index0, 
             raise ImageFormatError(_("Height should not be greater than {} (currently {}) for this image type.").format(max_height, connector.height))
         elif interlaced and connector.height % 2:
             raise ImageFormatError(_("Height should be even (currently {}) for interlaced images.").format(connector.height))
-        elif encoding == "DAT" and connector.height > MAX_DAT_HEIGHT * pages:
+        elif encoding == "dat" and connector.height > MAX_DAT_HEIGHT * pages:
             raise ImageFormatError(_("Height should not be greater than {} (currently {}) for this image type.").format(MAX_DAT_HEIGHT * pages, connector.height))
+
+    fixed_slots, forbidden_slots = parse_preserve_colors(preserve_colors)
 
     # create palette data
     pal9bits = [0] * 2 * MAX_COLORS
     txtpal = [(0, 0, 0)] * MAX_COLORS
 
     used_transparency = fix_transparency(connector, trans_color)
-    if not used_transparency:
-        trans_color = NOTRANS
-    else:
+    if used_transparency:
+        if 0 in fixed_slots:
+            raise ImageFormatError(_("Preserve index 0 conflicts with transparency (index 0 is reserved for transparent color)."))
+        if 0 in forbidden_slots:
+            raise ImageFormatError(_("Preserve index 0 cannot be forbidden when transparency is enabled."))
         # disable dithering when transparency is used
         dithering = False
+    else:
+        trans_color = NOTRANS
 
     # downsampling happens in place
     downsampling(connector, trans_color, dithering)
     histogram = create_histogram(connector, trans_color)
-    palette = quantize_colors(connector, histogram, max_colors)
-    query = create_distance_query(palette)
 
-    for (r, g, b), index in palette:
-        # Start palette at color 1 if transparency is used.
-        i = index + (1 if used_transparency else 0)
-        pal9bits[i * 2] = 16 * (r >> 5) + (b >> 5)
-        pal9bits[i * 2 + 1] = (g >> 5)
-        txtpal[i] = (r >> 5, g >> 5, b >> 5)
+    reserved = set(forbidden_slots) | set(fixed_slots.keys())
+    if used_transparency:
+        reserved.add(0)
+    available_slots = [i for i in range(MAX_COLORS) if i not in reserved]
+    qcount = len(available_slots)
+    quantized = quantize_colors(connector, histogram, qcount) if qcount > 0 else []
+
+    # slot -> compressed 8-bit RGB (r,g,b) for all usable palette entries
+    slot_colors = {}
+    for slot, rgb in fixed_slots.items():
+        slot_colors[slot] = compress_rgb(*rgb)[0:3]
+    for (color, _qidx), slot in zip(quantized, available_slots):
+        slot_colors[slot] = color
+
+    query_items = [(slot, slot_colors[slot]) for slot in sorted(slot_colors.keys())]
+    query = create_distance_query(query_items) if query_items else (lambda p: (0, (0, 0, 0)))
+
+    for slot, (r, g, b) in slot_colors.items():
+        pal9bits[slot * 2] = 16 * (r >> 5) + (b >> 5)
+        pal9bits[slot * 2 + 1] = (g >> 5)
+        txtpal[slot] = (r >> 5, g >> 5, b >> 5)
 
     if export_pal:
         encoded = struct.pack('<BHHH{}B'.format(len(pal9bits)), BIN_PREFIX, palette_offset,
                 palette_offset + len(pal9bits) - 1, 0, *pal9bits[0:len(pal9bits)])
-        with open(os.path.join(folder, '%s.PAL' % filename), 'wb') as file:
+        with open(os.path.join(folder, '%s.pal' % filename), 'wb') as file:
             file.write(encoded)
 
     connector.set_progress(text=_("Exporting image to {} format...").format(_(extension)))
@@ -350,8 +433,9 @@ def do_convert(connector, filename, folder, dithering, export_pal, skip_index0, 
         if pal_file:
             with open(os.path.join(folder, '%s.TXT' % filename), 'wt') as file:
                 print("16-color palette:", file=file)
-                for i, ((r, g, b), ignored) in enumerate(palette):
-                    print('%i: %i, %i, %i' % (i, r, g, b), file=file)
+                for slot in sorted(slot_colors.keys()):
+                    r, g, b = slot_colors[slot]
+                    print('%i: %i, %i, %i' % (slot, r >> 5, g >> 5, b >> 5), file=file)
         for y in range(connector.height):
             for x in range(connector.width):
                 c = connector.get_pixel(x, y)
@@ -372,18 +456,18 @@ def do_convert(connector, filename, folder, dithering, export_pal, skip_index0, 
                     print('%i: %i, %i, %i' % (i, r, g, b), file=file)
 
         # line size may vary for the MSX-BASIC COPY format
-        stride = connector.width // 2 if encoding == 'DAT' else line_size
+        stride = connector.width // 2 if encoding == 'dat' else line_size
         # number of lines stored in each page
         page_lines = (connector.height + 1) // 2 if interlaced else connector.height
 
         # complete buffer
-        if encoding in ('RAW', 'DAT'):
+        if encoding in ('raw', 'dat'):
             # raw files pack both pages together
             buffer = [0] * (stride * page_lines * pages)
         elif interlaced:
             # interlaced binary files keep the two pages apart
             buffer = [0] * max(page_size * pages, palette_offset + 2 * MAX_COLORS)
-        elif encoding == 'SC':
+        elif encoding == 'sc':
             # make sure to save space for inner palette
             buffer = [0] * max(palette_offset + 2 * MAX_COLORS, stride * page_lines)
         else:
@@ -397,11 +481,9 @@ def do_convert(connector, filename, folder, dithering, export_pal, skip_index0, 
                     index = 0
                 else:
                     index, ignored = query((c[0], c[1], c[2]))
-                    # index 0 is reserved for transparency only if it is used
-                    index += 1 if used_transparency else 0
                 if interlaced:
                     # even lines go to page 0, odd lines go to page 1
-                    if encoding in ('RAW', 'DAT'):
+                    if encoding in ('raw', 'dat'):
                         # raw files pack both pages together
                         pos = (y // 2) * stride if y % 2 == 0 else (page_lines + y // 2) * stride
                     else:
@@ -412,17 +494,17 @@ def do_convert(connector, filename, folder, dithering, export_pal, skip_index0, 
                 buffer[pos] |= index if x % 2 else index << 4;
             connector.set_progress(y/connector.height)
 
-        # Embed palette into image data (SC only)
-        if encoding == 'SC':
+        # Embed palette into image data (sc only)
+        if encoding == 'sc':
             for pos in range(2 * MAX_COLORS):
                 buffer[palette_offset + pos] = pal9bits[pos]
 
         # Interlaced SCREEN 7 does not fit in the 16-bit range of a single BSAVE
-        # file (2 x 64K pages), so it is split into two files: page 0 (.S70/.R70)
-        # and page 1 (.S71/.R71). Raw interlaced SCREEN 7 is split into page 0
+        # file (2 x 64K pages), so it is split into two files: page 0 (.s70/.r70)
+        # and page 1 (.s71/.r71). Raw interlaced SCREEN 7 is split into page 0
         # (.w70) and page 1 (.w71), one raw page per file.
-        split_sc7 = interlaced and screen_mode == "SCREEN7" and encoding in ('SC', 'SR')
-        split_raw_sc7 = interlaced and screen_mode == "SCREEN7" and encoding == 'RAW'
+        split_sc7 = interlaced and screen_mode == "SCREEN7" and encoding in ('sc', 'sr')
+        split_raw_sc7 = interlaced and screen_mode == "SCREEN7" and encoding == 'raw'
 
         if split_raw_sc7:
             page_bytes = page_lines * stride
@@ -432,21 +514,21 @@ def do_convert(connector, filename, folder, dithering, export_pal, skip_index0, 
                 encoded = struct.pack('<{}B'.format(len(page)), *page)
                 with open(os.path.join(folder, '%s.%s' % (filename, ext)), 'wb') as file:
                     file.write(encoded)
-        elif encoding == 'RAW':
+        elif encoding == 'raw':
             encoded = struct.pack('<{}B'.format(len(buffer)), *buffer)
             with open(os.path.join(folder, '%s.%s' % (filename, extension)), 'wb') as file:
                 file.write(encoded)
-        elif encoding == 'DAT':
+        elif encoding == 'dat':
             encoded = struct.pack('<HH{}B'.format(len(buffer)), connector.width, connector.height, *buffer)
             with open(os.path.join(folder, '%s.%s' % (filename, extension)), 'wb') as file:
                 file.write(encoded)
         elif split_sc7:
             page0 = buffer[0:page_size]
             page1 = buffer[page_size:page_size * 2]
-            if encoding == 'SC':
-                ext0, ext1 = 'S70', 'S71'
+            if encoding == 'sc':
+                ext0, ext1 = 's70', 's71'
             else:
-                ext0, ext1 = 'R70', 'R71'
+                ext0, ext1 = 'r70', 'r71'
             for ext, page in ((ext0, page0), (ext1, page1)):
                 encoded = struct.pack('<BHHH{}B'.format(len(page)), BIN_PREFIX, 0, len(page) - 1, 0, *page)
                 with open(os.path.join(folder, '%s.%s' % (filename, ext)), 'wb') as file:
@@ -638,6 +720,15 @@ class Graph4Exporter (Gimp.PlugIn):
             grid.attach(pal_label, 0, 9, 1, 1)
             grid.attach(pal_combo, 1, 9, 1, 1)
 
+            # Preserve index and color values
+            preserve_label = Gtk.Label(label="Preserve index and color values")
+            preserve_label.set_halign(Gtk.Align.END)
+            preserve_entry = Gtk.Entry()
+            preserve_entry.set_text(settings.get("preserve_colors", ""))
+            preserve_entry.set_placeholder_text("n=#RRGGBB, !n=#RRGGBB")
+            grid.attach(preserve_label, 0, 10, 1, 1)
+            grid.attach(preserve_entry, 1, 10, 1, 1)
+
             # Connect the index0 "changed" signal to trans_button
             index0_combo.connect("changed", on_combo_changed, trans_button)
             # apply initial sensitivity
@@ -658,6 +749,7 @@ class Graph4Exporter (Gimp.PlugIn):
                 trans_color = denormalize(trans_button.get_rgba())
                 encoding_value = ENC_GROUP[[item.get_active() for item in radio_box.get_children()].index(1)]
                 pal_value = pal_combo.get_active()
+                preserve_value = preserve_entry.get_text()
                 save_settings({
                     "filename": file_value,
                     "folder": folder_value,
@@ -669,6 +761,7 @@ class Graph4Exporter (Gimp.PlugIn):
                     "trans_color": list(trans_color),
                     "encoding": encoding_value,
                     "pal_file": pal_value,
+                    "preserve_colors": preserve_value,
                 })
                 dialog.destroy()
 
@@ -676,7 +769,7 @@ class Graph4Exporter (Gimp.PlugIn):
                 result = self.convert(PluginConnector(self),
                     file_value, folder_value, dithering_value, export_value,
                     index0_value, trans_color, encoding_value, pal_value,
-                    screen_value, interlaced_value)
+                    screen_value, interlaced_value, preserve_value)
                 return procedure.new_return_values(*result)
             else:
                 dialog.destroy()

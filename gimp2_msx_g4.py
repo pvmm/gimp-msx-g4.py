@@ -62,6 +62,7 @@ def load_settings():
         "trans_color": [255, 0, 255],
         "encoding": DEFAULT_OUTPUT_FMT,
         "pal_file": 0,
+        "preserve_colors": "",
     }
     try:
         with open(_settings_path(), "r") as f:
@@ -87,6 +88,9 @@ def load_settings():
     name = defaults.get("filename")
     if not isinstance(name, str) or not name:
         defaults["filename"] = DEFAULT_FILENAME
+    pc = defaults.get("preserve_colors")
+    if not isinstance(pc, str):
+        defaults["preserve_colors"] = ""
     return defaults
 
 
@@ -124,21 +128,27 @@ class ImageFormatError(Exception): pass
 class NoTransparentColorError(Exception): pass
 
 
-def create_distance_query(palette):
-    """Create function that returns the nearest colour by value."""
-    palmap = {k:v for k, v in palette}
+def create_distance_query(items):
+    """Create function that returns the nearest colour by value.
+
+    items: [(slot, (r, g, b)), ...]  slot is the MSX palette index.
+    Returns (slot, (r, g, b)).
+    """
+    palmap = {tuple(color): slot for slot, color in items}
+    slots = [(slot, tuple(color)) for slot, color in items]
+
     def query_index(pixel):
-        pixel = pixel[0:3]  # remove alpha channel
-        i = palmap.get(pixel)
-        # Exact match returns (index and colour tuple)
-        if i: return palette[i][1], palette[i][0]
-        distances = [(i, distance(pixel, color), color) for color, i in palette]
-        nearest = min(distances, key=tuple_value)
-        #pprint(('pixel =', pixel, ' distances =', distances, ' min =', nearest))
-        # Store value for fast lookup next time
-        palmap[pixel] = nearest[0]
-        # index and colour tuple
-        return nearest[0], nearest[2]
+        c = tuple(pixel[0:3])
+        slot = palmap.get(c)
+        if slot is not None:
+            return slot, c
+        nearest_slot, nearest_color, nearest_dist = None, None, None
+        for slot_i, color_i in slots:
+            d = distance(c, color_i)
+            if nearest_dist is None or d < nearest_dist:
+                nearest_slot, nearest_color, nearest_dist = slot_i, color_i, d
+        palmap[c] = nearest_slot
+        return nearest_slot, nearest_color
 
     return query_index
 
@@ -206,7 +216,7 @@ def check_params(image, filename, folder, encoding, exp_pal, paltxt_file, screen
     return errors
 
 
-def do_write_g4(image, layer, filename, folder, dithering, exp_pal, skip_index0, trans_color, encoding, paltxt_file, screen_mode, interlaced):
+def do_write_g4(image, layer, filename, folder, dithering, exp_pal, skip_index0, trans_color, encoding, paltxt_file, screen_mode, interlaced, preserve_colors=""):
     mode = SCREEN_MODES[screen_mode]
     line_size = mode["line_size"]
     page_size = mode["page_size"]
@@ -247,25 +257,47 @@ def do_write_g4(image, layer, filename, folder, dithering, exp_pal, skip_index0,
         gimpfu.pdb.gimp_image_convert_rgb(new_image);
     connector = PluginConnector(new_image)
 
+    fixed_slots, forbidden_slots = parse_preserve_colors(preserve_colors)
+
     # create palette data
     pal9bits = [0] * 2 * MAX_COLORS
     txtpal = [(0, 0, 0)] * MAX_COLORS
 
-    if not palette:
-        use_transparency = fix_transparency(connector, trans_color)
+    use_transparency = fix_transparency(connector, trans_color)
+    if use_transparency:
+        if 0 in fixed_slots:
+            raise ImageFormatError("Preserve index 0 conflicts with transparency (index 0 is reserved for transparent color).")
+        if 0 in forbidden_slots:
+            raise ImageFormatError("Preserve index 0 cannot be forbidden when transparency is enabled.")
         # disable dithering when transparency is used
-        dithering = False if use_transparency else dithering
-        downsampling(connector, trans_color, dithering)
-        histogram = create_histogram(connector, trans_color)
-        palette = quantize_colors(connector, histogram, max_colors)
-        query = create_distance_query(palette)
+        dithering = False
+    else:
+        trans_color = NOTRANS
 
-    for (r, g, b), index in palette:
-        # Start palette at color 1 if transparency is used.
-        i = index + (1 if use_transparency else 0)
-        pal9bits[i * 2] = 16 * (r >> 5) + (b >> 5)
-        pal9bits[i * 2 + 1] = (g >> 5)
-        txtpal[i] = (r >> 5, g >> 5, b >> 5)
+    downsampling(connector, trans_color, dithering)
+    histogram = create_histogram(connector, trans_color)
+
+    reserved = set(forbidden_slots) | set(fixed_slots.keys())
+    if use_transparency:
+        reserved.add(0)
+    available_slots = [i for i in range(MAX_COLORS) if i not in reserved]
+    qcount = len(available_slots)
+    quantized = quantize_colors(connector, histogram, qcount) if qcount > 0 else []
+
+    # slot -> compressed 8-bit RGB (r,g,b)
+    slot_colors = {}
+    for slot, rgb in fixed_slots.items():
+        slot_colors[slot] = compress_rgb(*rgb)[0:3]
+    for (color, _qidx), slot in zip(quantized, available_slots):
+        slot_colors[slot] = color
+
+    query_items = [(slot, slot_colors[slot]) for slot in sorted(slot_colors.keys())]
+    query = create_distance_query(query_items) if query_items else (lambda p: (0, (0, 0, 0)))
+
+    for slot, (r, g, b) in slot_colors.items():
+        pal9bits[slot * 2] = 16 * (r >> 5) + (b >> 5)
+        pal9bits[slot * 2 + 1] = (g >> 5)
+        txtpal[slot] = (r >> 5, g >> 5, b >> 5)
 
     if paltxt_file:
         file = open(os.path.join(folder, '%s.TXT' % filename), 'wt')
@@ -311,8 +343,6 @@ def do_write_g4(image, layer, filename, folder, dithering, exp_pal, skip_index0,
                     index = 0
                 else:
                     index, _ = query((r, g, b))
-                    # index 0 is reserved for transparency only if it is used
-                    index += 1 if use_transparency else 0
                 if interlaced:
                     # even lines go to page 0, odd lines go to page 1
                     if encoding in ('RAW', 'DAT'):
@@ -465,6 +495,58 @@ def compress_rgb(r, g, b, a=255):
     return (r, g, b, 255)
 
 
+def parse_preserve_colors(spec):
+    """Parse 'n=#RRGGBB, !n=#RRGGBB' into (fixed, forbidden).
+
+    fixed: {index: (r, g, b)}  - index and color value preserved.
+    forbidden: {index}          - index off-limits for conversion (color value
+                                  may still be used by other indices).
+    """
+    fixed = {}
+    forbidden = set()
+    spec = (spec or "").strip()
+    if not spec:
+        return fixed, forbidden
+    for token in spec.split(','):
+        token = token.strip()
+        if not token:
+            continue
+        is_forbidden = token.startswith('!')
+        if is_forbidden:
+            token = token[1:].strip()
+        if '=' not in token:
+            raise ImageFormatError('Invalid preserve entry "%s": expected n=#RRGGBB.' % token)
+        left, right = token.split('=', 1)
+        left = left.strip()
+        right = right.strip()
+        try:
+            idx = int(left, 10)
+        except ValueError:
+            raise ImageFormatError('Invalid preserve index "%s": expected 0-15.' % left)
+        if idx < 0 or idx > MAX_COLORS - 1:
+            raise ImageFormatError('Preserve index %i out of range (0-15).' % idx)
+        color = right.lstrip('#')
+        if len(color) != 6:
+            raise ImageFormatError('Invalid preserve color "%s": expected #RRGGBB.' % right)
+        try:
+            r = int(color[0:2], 16)
+            g = int(color[2:4], 16)
+            b = int(color[4:6], 16)
+        except ValueError:
+            raise ImageFormatError('Invalid preserve color "%s": expected #RRGGBB.' % right)
+        if is_forbidden:
+            if idx in fixed:
+                raise ImageFormatError('Preserve index %i cannot be both fixed and forbidden.' % idx)
+            forbidden.add(idx)
+        else:
+            if idx in forbidden:
+                raise ImageFormatError('Preserve index %i cannot be both fixed and forbidden.' % idx)
+            if idx in fixed and fixed[idx] != (r, g, b):
+                raise ImageFormatError('Preserve index %i specified twice with different colors.' % idx)
+            fixed[idx] = (r, g, b)
+    return fixed, forbidden
+
+
 def scatter_noise(connector, x, y, error):
     NEIGHBORS = ( (+1, 0, 7.0/16), (-1, +1, 3.0/16), (-1, +1, 5.0/16), (+1, +1, 1.0/16) )
     for offset_x, offset_y, debt in NEIGHBORS:
@@ -492,7 +574,7 @@ def downsampling(connector, trans_color, dithering):
         connector.set_progress(float(y) / connector.height)
 
 
-def write_g4(image, layer, filename, folder, dithering, exp_pal, skip_index0, trans_color, encoding, paltxt_file, screen_mode, interlaced):
+def write_g4(image, layer, filename, folder, dithering, exp_pal, skip_index0, trans_color, encoding, paltxt_file, screen_mode, interlaced, preserve_colors=""):
     '''
     Export image to GRAPHICS 4, a.k.a. SCREEN 5 (MSX2).
     
@@ -508,6 +590,7 @@ def write_g4(image, layer, filename, folder, dithering, exp_pal, skip_index0, tr
     @param paltxt_file: export plain-text-palette data too
     @param screen_mode: SCREEN5 or SCREEN7
     @param interlaced: double vertical resolution (two pages)
+    @param preserve_colors: comma-separated "n=#RRGGBB" / "!n=#RRGGBB" entries
     '''
     try:
         tc = tuple(trans_color) if trans_color else (255, 0, 255)
@@ -522,13 +605,14 @@ def write_g4(image, layer, filename, folder, dithering, exp_pal, skip_index0, tr
             "trans_color": [int(tc[0]), int(tc[1]), int(tc[2])],
             "encoding": encoding,
             "pal_file": int(paltxt_file),
+            "preserve_colors": preserve_colors or "",
         })
-        do_write_g4(image, layer, filename, folder, dithering, exp_pal, skip_index0, trans_color, encoding, paltxt_file, screen_mode, interlaced)
+        do_write_g4(image, layer, filename, folder, dithering, exp_pal, skip_index0, trans_color, encoding, paltxt_file, screen_mode, interlaced, preserve_colors)
     except Exception:
         gimp.message(traceback.format_exc())
 
 
-def write_g4_alpha(image, layer, filename, folder, dithering, exp_pal, encoding, paltxt_file, screen_mode, interlaced):
+def write_g4_alpha(image, layer, filename, folder, dithering, exp_pal, encoding, paltxt_file, screen_mode, interlaced, preserve_colors=""):
     '''
     Export image with alpha to GRAPHICS 4, a.k.a. SCREEN 5 (MSX2).
     
@@ -542,6 +626,7 @@ def write_g4_alpha(image, layer, filename, folder, dithering, exp_pal, encoding,
     @param paltxt_file: export plain-text-palette data too
     @param screen_mode: SCREEN5 or SCREEN7
     @param interlaced: double vertical resolution (two pages)
+    @param preserve_colors: comma-separated "n=#RRGGBB" / "!n=#RRGGBB" entries
     '''
     try:
         # keep last used transparent color for non-alpha dialog; alpha uses image alpha
@@ -557,8 +642,9 @@ def write_g4_alpha(image, layer, filename, folder, dithering, exp_pal, encoding,
             "trans_color": prev.get("trans_color", [255, 0, 255]),
             "encoding": encoding,
             "pal_file": int(paltxt_file),
+            "preserve_colors": preserve_colors or "",
         })
-        do_write_g4(image, layer, filename, folder, dithering, exp_pal, True, None, encoding, paltxt_file, screen_mode, interlaced)
+        do_write_g4(image, layer, filename, folder, dithering, exp_pal, True, None, encoding, paltxt_file, screen_mode, interlaced, preserve_colors)
     except Exception:
         gimp.message(traceback.format_exc())
 
@@ -587,7 +673,8 @@ gimpfu.register("msx_g4_exporter",
                         ("MSX-BASIC COPY to disk (no palette)", "DAT"),
                         ("Raw file without formatting (no palette)", "RAW"),
                         ("No output (image in new window)", "no-output"))),
-                    (gimpfu.PF_BOOL, "paltxt_file", "Export plain text palette", bool(_SETTINGS["pal_file"]))
+                    (gimpfu.PF_BOOL, "paltxt_file", "Export plain text palette", bool(_SETTINGS["pal_file"])),
+                    (gimpfu.PF_STRING, "preserve_colors", "Preserve index and color values", _SETTINGS.get("preserve_colors", "")),
                 ],
                 [],
                 write_g4)
@@ -614,7 +701,8 @@ gimpfu.register("msx_g4_exporter_alpha",
                         ("MSX-BASIC COPY to disk (no palette)", "DAT"),
                         ("Raw file without formatting (no palette)", "RAW"),
                         ("No output (image in new window)", "no-output"))),
-                    (gimpfu.PF_BOOL, "paltxt-file", "Export plain text palette", bool(_SETTINGS["pal_file"]))
+                    (gimpfu.PF_BOOL, "paltxt-file", "Export plain text palette", bool(_SETTINGS["pal_file"])),
+                    (gimpfu.PF_STRING, "preserve_colors", "Preserve index and color values", _SETTINGS.get("preserve_colors", "")),
                 ],
                 [],
                 write_g4_alpha)
